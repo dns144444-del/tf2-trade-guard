@@ -1,0 +1,10 @@
+{
+  "name": "tf2-trade-guard",
+  "version": "0.7.1",
+  "private": true,
+  "description": "Userscript that warns about Steam API key scams and impostor accounts in trade offers.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test"
+  }
+}
