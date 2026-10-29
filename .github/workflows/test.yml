@@ -1,0 +1,35 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+# read-only: this workflow never needs to write to the repository
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        node: [22, 24]
+    steps:
+      # actions pinned to exact commits: a tag can be moved to different code, a hash can't
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ matrix.node }}
+
+      # test-only dependency (linkedom), exactly as locked; package install scripts never run
+      - name: Install test dependencies
+        run: npm ci --ignore-scripts
+
+      - name: Syntax check
+        run: node --check tf2-trade-guard.user.js
+
+      - name: Tests
+        run: npm test
