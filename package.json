@@ -1,6 +1,6 @@
 {
   "name": "tf2-trade-guard",
-  "version": "0.7.2",
+  "version": "0.8.0",
   "private": true,
   "description": "Userscript that warns Steam traders about API key scams, impostors, copied offers, fake items and phishing.",
   "license": "MIT",
