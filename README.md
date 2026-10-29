@@ -1,11 +1,19 @@
 # TF2 Trade Guard
 
+[![Tests](https://github.com/dns144444-del/tf2-trade-guard/actions/workflows/test.yml/badge.svg)](https://github.com/dns144444-del/tf2-trade-guard/actions/workflows/test.yml)
+
 A userscript that protects Steam traders from the scams that empty the most TF2 inventories:
 
 1. **The API key scam.** A phishing site registers a Steam Web API key on your account. With it, the scammer watches your trade offers, cancels the real one and instantly sends you an identical offer from an impostor account.
 2. **Impostor accounts.** Someone copies the name and avatar of your friend, a middleman or a well-known trading bot.
 3. **Fake items.** A cheap item gets a Name Tag or Description Tag that makes it look like an Unusual, an Australium or a key.
 4. **Phishing links.** A message or comment sends you to a copy of Steam or a trading site to steal your login.
+
+![An impostor's offer flagged in red next to a legitimate offer from a friend](docs/screenshots/trade-offers.png)
+
+![The API key banner, and a phishing comment flagged on a profile](docs/screenshots/api-key-and-comments.png)
+
+*The real script running on a simulated Steam page, with fictional accounts.*
 
 ## What it does
 
@@ -39,6 +47,7 @@ A userscript that protects Steam traders from the scams that empty the most TF2 
 - Names from Steam are inserted as plain text, never as HTML.
 - **It fails loudly.** If a check can't run (Steam changed a page, a request failed, the friends list didn't load), you get a yellow warning instead of a green "No alerts".
 - Trusting your own API key requires typing its domain, so a phishing page can't talk you into a single click.
+- Found a security issue, or a way to get past a check? Please report it privately, see [SECURITY.md](SECURITY.md).
 
 ## Install
 
@@ -64,11 +73,21 @@ The script declares `@downloadURL none`, so Tampermonkey never updates it on its
 
 ## Development
 
-The detection logic (`Core`) is pure and unit tested:
+The userscript is a single file with no dependencies, so what you read here is exactly what you install.
+It has three parts: `Core` (pure detection logic), `Page` (reads Steam's markup) and the browser layer.
+The tests cover all three:
+
+- `tests/core.test.js`: the detection logic, with cases taken from real data.
+- `tests/page.test.js`: page parsing, on HTML fixtures shaped like Steam's pages.
+- `tests/userscript.test.js`: the whole script running on a simulated Steam page.
+- `tests/source.test.js`, `tests/style.test.js`: no hidden characters, no HTML built from strings, one style.
 
 ```sh
+npm ci --ignore-scripts   # test-only dependency: linkedom, a small DOM for Node
 npm test
 ```
+
+See [CHANGELOG.md](CHANGELOG.md) for the changes in each release.
 
 ## License
 
