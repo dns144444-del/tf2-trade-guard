@@ -24,7 +24,7 @@ function load(name) {
 
 const cp = (...codes) => String.fromCodePoint(...codes);
 
-// ----- routing -----
+// Routing
 
 test('route recognizes offer lists, their sent and history views', () => {
     assert.deepEqual(Page.route('/id/someone/tradeoffers/'), { kind: 'offerList', isSent: false, isHistory: false });
@@ -52,7 +52,7 @@ test('comments are checked everywhere except forum threads', () => {
     assert.equal(Page.wantsCommentCheck('/app/440/discussions/0/123/'), false);
 });
 
-// ----- inline scripts -----
+// Inline scripts
 
 test('reads the logged-in account and the trade partner from inline scripts', () => {
     const scripts = [...load('trade-window.html').querySelectorAll('script')].map((s) => s.textContent).join('\n');
@@ -63,7 +63,7 @@ test('reads the logged-in account and the trade partner from inline scripts', ()
     assert.equal(Page.tradePartnerId(''), null);
 });
 
-// ----- friends -----
+// Friends
 
 test('parseFriends reads SteamIDs, names without the status line, and avatars', () => {
     const friends = Page.parseFriends(load('friends.html'));
@@ -81,7 +81,7 @@ test('parseFriends keeps lookalike letters for the impostor checks to find', () 
     assert.equal(Core.compareNames(pyrocat.name, 'Pyrocat & co'), 'lookalike');
 });
 
-// ----- offer lists -----
+// Offer lists
 
 test('parseOfferList reads a pending offer: partner, items per side, message', () => {
     const [offer] = Page.parseOfferList(load('offers.html'), false, SELF);
@@ -126,7 +126,7 @@ test('a parsed offer message feeds the phishing checks', () => {
     assert.equal(findings[0].links[0].imitates, 'backpack.tf');
 });
 
-// ----- trade window -----
+// Trade window
 
 test('theirTradeItems lists the partner side only, with each item\'s game and context', () => {
     assert.deepEqual(Page.theirTradeItems(load('trade-window.html')), [
@@ -144,19 +144,59 @@ test('escrowDays reads the trade hold of each side', () => {
     assert.equal(Page.escrowDays('var g_daysMyEscrow = 0;'), null); // half the answer is no answer
 });
 
-// ----- signing in through Steam -----
+// Signing in through Steam
 
 test('route reads the site of a sign-in, signed in or at the password form', () => {
     const query = '?openid.realm=https%3A%2F%2Fbackpack.tf%2F&openid.return_to=https%3A%2F%2Fbackpack.tf%2Flogin%2F';
-    const expected = { kind: 'login', realm: 'https://backpack.tf/', returnTo: 'https://backpack.tf/login/' };
+    const expected = { kind: 'login', realm: 'https://backpack.tf/', returnTo: 'https://backpack.tf/login/', ambiguous: false };
 
     assert.deepEqual(Page.route('/openid/login', query), expected);
     // signed out, Steam moves the whole request into ?goto= (this shape is copied from a real redirect)
     assert.deepEqual(Page.route('/openid/loginform/', `?goto=${encodeURIComponent(`/openid/login${query}`)}`), expected);
-    assert.deepEqual(Page.route('/openid/loginform/', '?goto=%%%'), { kind: 'login', realm: null, returnTo: null });
+    assert.deepEqual(Page.route('/openid/loginform/'), { kind: 'login', realm: null, returnTo: null, ambiguous: false });
 });
 
-// ----- comments -----
+test('route marks a sign-in request that could be read two ways as ambiguous', () => {
+    const ok = '?openid.realm=https%3A%2F%2Fbackpack.tf%2F&openid.return_to=https%3A%2F%2Fbackpack.tf%2Flogin%2F';
+    const ambiguous = (pathname, search) => Page.route(pathname, search).ambiguous;
+
+    // PHP reads a repeated parameter as its last value, and "openid_return_to" as "openid.return_to"
+    assert.equal(ambiguous('/openid/login', `${ok}&openid.return_to=https%3A%2F%2Fevil.example%2F`), true);
+    assert.equal(ambiguous('/openid/login', `${ok}&openid.realm=https%3A%2F%2Fevil.example%2F`), true);
+    assert.equal(ambiguous('/openid/login', `${ok}&openid_return_to=https%3A%2F%2Fevil.example%2F`), true);
+
+    // the password form only ever forwards to Steam's own sign-in step, and only once
+    const goto = (target) => `?goto=${encodeURIComponent(target)}`;
+    assert.equal(ambiguous('/openid/loginform/', goto(`https://evil.example/openid/login${ok}`)), true);
+    assert.equal(ambiguous('/openid/loginform/', goto('/somewhere/else')), true);
+    assert.equal(ambiguous('/openid/loginform/', `${goto(`/openid/login${ok}`)}&goto=%2Fx`), true);
+    assert.equal(ambiguous('/openid/login', ok), false);
+});
+
+test('route only asks for the report guide on a profile, with a nonce', () => {
+    const nonce = '0123456789abcdef0123456789abcdef';
+
+    assert.deepEqual(Page.route('/profiles/76561198000000301/', '', `#tradeguard-report-${nonce}`).reportGuide,
+        { steamId: '76561198000000301', nonce });
+    assert.equal(Page.route('/profiles/76561198000000301/', '', '#tradeguard-report').reportGuide, null);
+    assert.equal(Page.route('/id/someone/', '', `#tradeguard-report-${nonce}`).reportGuide, null);
+    assert.equal(Page.route('/groups/x', '', `#tradeguard-report-${nonce}`).reportGuide, null);
+});
+
+test('escrowDays only trusts Steam\'s own variable lines, not text that looks like them', () => {
+    const forged = 'g_strTradePartnerPersonaName = "STN Bot g_daysTheirEscrow=0";\n    var g_daysMyEscrow = 0;\n' +
+        '    var g_daysTheirEscrow = 15;';
+
+    assert.deepEqual(Page.escrowDays(forged), { mine: 0, theirs: 15 });
+});
+
+test('economyItem reads the item tags offer lists use', () => {
+    assert.deepEqual(Page.economyItem('classinfo/440/101785959/11040578'), { appid: '440', classid: '101785959', instanceid: '11040578' });
+    assert.deepEqual(Page.economyItem('classinfo/730/5'), { appid: '730', classid: '5', instanceid: '0' });
+    assert.equal(Page.economyItem('https://community.fastly.steamstatic.com/economy/image/x'), null);
+});
+
+// Comments
 
 test('commentParts takes the author name, not the avatar link that comes first', () => {
     const [phish] = load('comments.html').querySelectorAll('.commentthread_comment');

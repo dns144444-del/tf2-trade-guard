@@ -89,8 +89,8 @@ test('compareNames: blank-looking names, combining marks and Latin look-alikes',
 });
 
 test('assessPartner flags names that imitate the panel or flip their text', () => {
-    assert.deepEqual(codes(Core.assessPartner(profile({ name: 'Kiro - SteamID64: 76561198000000301' }), [], { now: NOW })), ['nameHasSteamId']);
-    assert.deepEqual(codes(Core.assessPartner(profile({ name: cp(0x202E) + 'tob' }), [], { now: NOW })), ['directionTrick']);
+    assert.deepEqual(codes(assess(profile({ name: 'Kiro - SteamID64: 76561198000000301' }), [], { now: NOW })), ['nameHasSteamId']);
+    assert.deepEqual(codes(assess(profile({ name: cp(0x202E) + 'tob' }), [], { now: NOW })), ['directionTrick']);
 });
 
 test('compareNames: names made only of symbols are not matched by skeleton', () => {
@@ -209,7 +209,7 @@ test('findMirroredOffer does not flag paying the same keys for different things'
 
 test('assessPartner warns about a name changed in the last week', () => {
     const aliases = [{ newname: 'Mann Co. Bot', timechanged: '28 Oct @ 4:41pm' }, { newname: 'xX_gamer_Xx', timechanged: '1 Jan, 2024 @ 2:00pm' }];
-    const result = Core.assessPartner(profile({ name: 'Mann Co. Bot' }), [], { now: NOW, aliases });
+    const result = assess(profile({ name: 'Mann Co. Bot' }), [], { now: NOW, aliases });
     const finding = result.findings.find((f) => f.code === 'recentRename');
 
     assert.equal(finding.level, 'warning');
@@ -225,21 +225,21 @@ const EXAMPLE_ALIASES = [
 ];
 
 test('assessPartner lists up to three previous names for old renames', () => {
-    const result = Core.assessPartner(profile({ name: 'Kiro' }), [], { now: NOW, aliases: EXAMPLE_ALIASES });
+    const result = assess(profile({ name: 'Kiro' }), [], { now: NOW, aliases: EXAMPLE_ALIASES });
 
     assert.deepEqual(result.findings, [{ level: 'info', code: 'renamed', previousNames: ['RocketMan', 'Pyrocat'] }]);
 });
 
 test('assessPartner handles name history that does not include the current name', () => {
     const aliases = [{ newname: 'Old Name', timechanged: '28 Oct @ 4:41pm' }];
-    const result = Core.assessPartner(profile({}), [], { now: NOW, aliases });
+    const result = assess(profile({}), [], { now: NOW, aliases });
 
     assert.deepEqual(result.findings, [{ level: 'info', code: 'renamed', previousNames: ['Old Name'] }]);
 });
 
 test('assessPartner flags an account that used to be named like a friend', () => {
     const aliases = [{ newname: 'Someone', timechanged: '1 Jan, 2020 @ 2:00pm' }, { newname: 'M\u0430nn Co. Bot', timechanged: '1 Jan, 2019 @ 2:00pm' }];
-    const result = Core.assessPartner(profile({}), [FRIEND], { now: NOW, aliases });
+    const result = assess(profile({}), [FRIEND], { now: NOW, aliases });
     const finding = result.findings.find((f) => f.code === 'formerlyNamedLike');
 
     assert.equal(finding.level, 'warning');
@@ -251,7 +251,7 @@ test('assessPartner does not call two real friends with the same name impostors'
     const soundA = { steamId: '76561198000000201', name: 'sound', avatarHash: 'a'.repeat(40), source: 'friend' };
     const soundB = { steamId: '76561198000000202', name: 'sound', avatarHash: 'b'.repeat(40), source: 'friend' };
     const partner = profile({ steamId: soundA.steamId, name: 'sound', avatarHash: soundA.avatarHash });
-    const result = Core.assessPartner(partner, [soundA, soundB], { now: NOW });
+    const result = assess(partner, [soundA, soundB], { now: NOW });
 
     assert.deepEqual(codes(result), ['isFriend', 'sharedIdentity']);
     assert.equal(Core.worstLevel(result.findings), 'warning');
@@ -260,7 +260,7 @@ test('assessPartner does not call two real friends with the same name impostors'
 test('assessPartner still flags a stranger copying a friend who shares a name with another friend', () => {
     const soundA = { steamId: '76561198000000201', name: 'sound', avatarHash: 'a'.repeat(40), source: 'friend' };
     const soundB = { steamId: '76561198000000202', name: 'sound', avatarHash: 'b'.repeat(40), source: 'friend' };
-    const result = Core.assessPartner(profile({ name: 'sound' }), [soundA, soundB], { now: NOW });
+    const result = assess(profile({ name: 'sound' }), [soundA, soundB], { now: NOW });
 
     assert.deepEqual(codes(result), ['impostorFriend', 'impostorFriend']);
 });
@@ -322,6 +322,17 @@ test('estimateCreationTime is not poisoned by one learned anchor dated far too l
     assert.equal(Core.estimateCreationTime(bad, NOW, poison), Core.estimateCreationTime(bad, NOW));
 });
 
+// contacts as tests write them: { steamId, name, avatarHash, source: 'friend' | 'partner' | 'verified', recentFriend }
+function known(entries) {
+    return Core.mergeContacts({
+        friends: entries.filter((e) => e.source === 'friend').map((e) => ({ ...e, recent: Boolean(e.recentFriend) })),
+        partners: entries.filter((e) => e.source === 'partner'),
+        bots: entries.filter((e) => e.source === 'verified')
+    });
+}
+
+const assess = (partner, entries, evidence) => Core.assessPartner(partner, known(entries), evidence);
+
 function profile(overrides) {
     return {
         steamId: '76561198000000099',
@@ -339,7 +350,7 @@ const FRIEND = { steamId: '76561198000000001', name: 'Mann Co. Bot', avatarHash:
 const codes = (result) => result.findings.map((f) => f.code);
 
 test('assessPartner flags a copied avatar with a similar name as an impostor', () => {
-    const result = Core.assessPartner(profile({ name: 'Mann Co. Bot Official', avatarHash: FRIEND.avatarHash }), [FRIEND], { now: NOW });
+    const result = assess(profile({ name: 'Mann Co. Bot Official', avatarHash: FRIEND.avatarHash }), [FRIEND], { now: NOW });
     const finding = result.findings.find((f) => f.code === 'impostorFriend');
 
     assert.ok(finding);
@@ -350,7 +361,7 @@ test('assessPartner flags a copied avatar with a similar name as an impostor', (
 
 test('assessPartner only warns about a shared avatar with an unrelated name', () => {
     // official Steam avatars are used by thousands of unrelated accounts
-    const result = Core.assessPartner(profile({ name: 'Totally Different', avatarHash: FRIEND.avatarHash }), [FRIEND], { now: NOW });
+    const result = assess(profile({ name: 'Totally Different', avatarHash: FRIEND.avatarHash }), [FRIEND], { now: NOW });
 
     assert.deepEqual(codes(result), ['sameAvatar']);
     assert.equal(Core.worstLevel(result.findings), 'warning');
@@ -358,7 +369,7 @@ test('assessPartner only warns about a shared avatar with an unrelated name', ()
 
 test('assessPartner does not call a generic one-letter name an impostor', () => {
     const friendA = { steamId: '76561198000000203', name: 'A', avatarHash: null, source: 'friend' };
-    const result = Core.assessPartner(profile({ name: 'A' }), [friendA], { now: NOW });
+    const result = assess(profile({ name: 'A' }), [friendA], { now: NOW });
 
     assert.deepEqual(codes(result), ['similarName']);
     assert.equal(Core.worstLevel(result.findings), 'warning');
@@ -367,7 +378,7 @@ test('assessPartner does not call a generic one-letter name an impostor', () => 
 test('assessPartner ignores short former names when looking for past impersonation', () => {
     const friendA = { steamId: '76561198000000203', name: 'A', avatarHash: null, source: 'friend' };
     const aliases = [{ newname: 'Someone', timechanged: '1 Jan, 2020 @ 2:00pm' }, { newname: 'A', timechanged: '1 Jan, 2019 @ 2:00pm' }];
-    const result = Core.assessPartner(profile({}), [friendA], { now: NOW, aliases });
+    const result = assess(profile({}), [friendA], { now: NOW, aliases });
 
     assert.equal(result.findings.some((f) => f.code === 'formerlyNamedLike'), false);
 });
@@ -376,7 +387,7 @@ test('assessPartner flags a new account copying a past partner\'s name', () => {
     const partner = { ...FRIEND, source: 'partner' };
     const copy = profile({ name: 'M\u0430nn Co. Bot', avatarHash: Core.avatarHash(AVATAR_B), memberSince: 'October 1, 2026' });
 
-    assert.deepEqual(codes(Core.assessPartner(copy, [partner], { now: NOW })).sort(), ['impostorPartner', 'newAccount']);
+    assert.deepEqual(codes(assess(copy, [partner], { now: NOW })).sort(), ['impostorPartner', 'newAccount']);
 });
 
 test('assessPartner keeps a private or just-renamed copy of a past partner red', () => {
@@ -385,14 +396,14 @@ test('assessPartner keeps a private or just-renamed copy of a past partner red',
     const renamedCopy = profile({ name: 'Mann Co. Bot' });
     const aliases = [{ newname: 'Mann Co. Bot', timechanged: '27 Oct @ 9:00pm' }, { newname: 'random guy', timechanged: '1 Jan, 2016 @ 1:00pm' }];
 
-    assert.ok(codes(Core.assessPartner(privateCopy, [partner], { now: NOW })).includes('impostorPartner'));
-    assert.ok(codes(Core.assessPartner(renamedCopy, [partner], { now: NOW, aliases })).includes('impostorPartner'));
+    assert.ok(codes(assess(privateCopy, [partner], { now: NOW })).includes('impostorPartner'));
+    assert.ok(codes(assess(renamedCopy, [partner], { now: NOW, aliases })).includes('impostorPartner'));
 });
 
 test('assessPartner treats an old, public account with a past partner\'s name as a possible sibling bot', () => {
     const partner = { ...FRIEND, source: 'partner' };
     const siblingBot = profile({ name: 'Mann Co. Bot', avatarHash: FRIEND.avatarHash });
-    const result = Core.assessPartner(siblingBot, [partner], { now: NOW });
+    const result = assess(siblingBot, [partner], { now: NOW });
 
     assert.deepEqual(codes(result), ['samePartnerName']);
     assert.equal(Core.worstLevel(result.findings), 'warning');
@@ -402,7 +413,7 @@ test('assessPartner does not give a recently added friend the benefit of the dou
     const realKiro = { steamId: '76561198000000301', name: 'Kiro', avatarHash: 'a'.repeat(40), source: 'friend' };
     const newKiro = { steamId: '76561199900000000', name: 'Kiro', avatarHash: 'b'.repeat(40), source: 'friend', recentFriend: true };
     const partner = profile({ steamId: newKiro.steamId, name: 'Kiro' });
-    const result = Core.assessPartner(partner, [realKiro, newKiro], { now: NOW });
+    const result = assess(partner, [realKiro, newKiro], { now: NOW });
 
     assert.deepEqual(codes(result).sort(), ['impostorFriend', 'isFriend', 'recentFriend']);
     assert.equal(Core.worstLevel(result.findings), 'danger');
@@ -410,7 +421,7 @@ test('assessPartner does not give a recently added friend the benefit of the dou
 
 test('assessPartner treats the real friend as safe', () => {
     const partner = profile({ steamId: FRIEND.steamId, name: FRIEND.name, avatarHash: FRIEND.avatarHash });
-    const result = Core.assessPartner(partner, [FRIEND], { now: NOW });
+    const result = assess(partner, [FRIEND], { now: NOW });
 
     assert.deepEqual(codes(result), ['isFriend']);
     assert.equal(Core.worstLevel(result.findings), 'ok');
@@ -418,37 +429,37 @@ test('assessPartner treats the real friend as safe', () => {
 
 test('assessPartner ignores the user\'s own account', () => {
     const self = { steamId: '76561198000000555', name: 'Someone', avatarHash: null, source: 'partner' };
-    const result = Core.assessPartner(profile({}), [self], { now: NOW, selfId: self.steamId });
+    const result = assess(profile({}), [self], { now: NOW, selfId: self.steamId });
 
     assert.deepEqual(codes(result), []);
 });
 
 test('assessPartner reports trade bans, new, private and limited accounts', () => {
-    assert.deepEqual(codes(Core.assessPartner(profile({ tradeBan: 'Banned' }), [], { now: NOW })), ['tradeBan']);
-    assert.deepEqual(codes(Core.assessPartner(profile({ memberSince: 'October 19, 2026' }), [], { now: NOW })), ['newAccount']);
-    assert.deepEqual(codes(Core.assessPartner(profile({ memberSince: null, privacy: 'private' }), [], { now: NOW })), ['privateProfile']);
-    assert.deepEqual(codes(Core.assessPartner(profile({ limited: true }), [], { now: NOW })), ['limited']);
+    assert.deepEqual(codes(assess(profile({ tradeBan: 'Banned' }), [], { now: NOW })), ['tradeBan']);
+    assert.deepEqual(codes(assess(profile({ memberSince: 'October 19, 2026' }), [], { now: NOW })), ['newAccount']);
+    assert.deepEqual(codes(assess(profile({ memberSince: null, privacy: 'private' }), [], { now: NOW })), ['privateProfile']);
+    assert.deepEqual(codes(assess(profile({ limited: true }), [], { now: NOW })), ['limited']);
 });
 
 test('assessPartner estimates the age of private profiles from the SteamID', () => {
-    const oldPrivate = Core.assessPartner(profile({ memberSince: null, privacy: 'friendsonly' }), [], { now: NOW });
+    const oldPrivate = assess(profile({ memberSince: null, privacy: 'friendsonly' }), [], { now: NOW });
     assert.equal(oldPrivate.ageEstimated, true);
     assert.ok(oldPrivate.ageDays > 365 * 10);
     assert.deepEqual(codes(oldPrivate), ['privateProfile']);
 
-    const newPrivate = Core.assessPartner(profile({ steamId: '76561200060265728', memberSince: null, privacy: 'private' }), [], { now: NOW });
+    const newPrivate = assess(profile({ steamId: '76561200060265728', memberSince: null, privacy: 'private' }), [], { now: NOW });
     assert.deepEqual(codes(newPrivate).sort(), ['newAccountEstimated', 'privateProfile']);
 });
 
 test('assessPartner no longer calls an old account with a year-less date new', () => {
-    const bot = Core.assessPartner(profile({ steamId: '76561198660265728', memberSince: 'August 7' }), [], { now: NOW });
+    const bot = assess(profile({ steamId: '76561198660265728', memberSince: 'August 7' }), [], { now: NOW });
 
     assert.equal(bot.ageEstimated, false);
     assert.equal(bot.ageDays, daysSinceUtc(2017, 8, 7));
     assert.deepEqual(codes(bot), []);
 });
 
-// ----- items: Name Tags and Description Tags -----
+// Items: Name Tags and Description Tags
 
 const NL = String.fromCharCode(10);
 
@@ -523,7 +534,7 @@ test('itemFindings catches value words written with lookalike letters', () => {
     assert.deepEqual(Core.itemCustomization(cyrillic).claims, ['unusual']);
 });
 
-// ----- messages and comments -----
+// Messages and comments
 
 const linkCodes = (text, hrefs = [], options = { unknownLinks: true }) =>
     Core.analyzeText(text, hrefs, options).map((f) => f.code);
@@ -588,10 +599,10 @@ test('impersonatesStaff catches names claiming to be Steam or Valve staff', () =
 });
 
 test('assessPartner flags names claiming to be staff', () => {
-    assert.deepEqual(codes(Core.assessPartner(profile({ name: 'Steam Support' }), [], { now: NOW })), ['staffImpersonation']);
+    assert.deepEqual(codes(assess(profile({ name: 'Steam Support' }), [], { now: NOW })), ['staffImpersonation']);
 });
 
-// ----- trade holds and items from other games -----
+// Trade holds and items from other games
 
 test('looksLikeBot recognizes the names trading sites give their bots', () => {
     for (const name of ['STN Trading Bot #12', 'Scrap.TF Bot', 'B0T', 'mannco.store #3', 'Quicksell 7']) {
@@ -630,7 +641,7 @@ test('otherGameFindings notes items from other games and flags ones posing as TF
     assert.equal(Core.otherGameFindings([{ appid: '999', description: { name: 'Thing' } }])[0].apps[0], 'app 999');
 });
 
-// ----- comment walls -----
+// Comment walls
 
 test('isScamReport reads warnings, not praise', () => {
     for (const text of ['SCAMMER!! stole my unusual', '-rep scammed me', 'do not trade, impostor of my friend', 'Fake bot, api scam']) {
@@ -642,53 +653,67 @@ test('isScamReport reads warnings, not praise', () => {
     assert.equal(Core.isScamReport(`sc${cp(0x0430)}mmer`), true); // lookalike letters don't hide it
 });
 
-test('commentWallFindings weighs how many different people wrote a warning', () => {
+test('scamReports keeps only other people\'s warnings, never the partner\'s own or praise', () => {
     const partner = '76561198000000999';
-    const wall = [
-        { authorId: '1', text: 'scammer' },
-        { authorId: '2', text: 'stole my hat' },
-        { authorId: partner, text: 'people call me a scammer lol' }, // the partner's own comment
-        { authorId: '2', text: 'scammer again' }
-    ];
+    const wall = {
+        hidden: false,
+        comments: [
+            { authorId: '1', text: '  SCAMMER   stole my hat  ' },
+            { authorId: partner, text: 'people call me a scammer lol' },
+            { authorId: '2', text: '+rep fast trade' },
+            { authorId: null, text: 'scammer' }, // no known author: not one more person
+            { authorId: '3', text: 'nice profile' }
+        ]
+    };
 
-    const two = Core.commentWallFindings(wall, partner);
+    assert.deepEqual(Core.scamReports(wall, partner), { hidden: false, reports: [{ authorId: '1', text: 'SCAMMER stole my hat' }] });
+    assert.deepEqual(Core.scamReports({ hidden: true, comments: [] }, partner), { hidden: true, reports: [] });
+});
+
+test('commentWallFindings weighs how many different people wrote a warning', () => {
+    const report = (authorId, text) => ({ authorId, text });
+    const two = Core.commentWallFindings({ hidden: false, reports: [report('1', 'scammer'), report('2', 'stole my hat'), report('2', 'again')] });
+
     assert.deepEqual(two.map((f) => [f.level, f.code, f.value]), [['warning', 'scamReports', 2]]);
     assert.deepEqual(two[0].excerpts, ['scammer', 'stole my hat']);
 
-    const three = Core.commentWallFindings(wall.concat({ authorId: '3', text: 'impostor' }), partner);
+    const reports = [report('1', 'a'), report('2', 'b'), report('3', 'c')];
+    const three = Core.commentWallFindings({ hidden: false, reports });
     assert.equal(three[0].level, 'danger');
-    assert.deepEqual(Core.commentWallFindings([{ authorId: '1', text: '+rep' }], partner), []);
+    assert.deepEqual(Core.commentWallFindings({ hidden: false, reports: [] }), []);
+    assert.deepEqual(Core.commentWallFindings(undefined), []);
 });
 
 test('commentWallFindings flags hidden comments only on new accounts', () => {
-    assert.deepEqual(Core.commentWallFindings([], 'x', { hidden: true, ageDays: 20 }),
-        [{ level: 'warning', code: 'commentsHidden' }]);
-    assert.deepEqual(Core.commentWallFindings([], 'x', { hidden: true, ageDays: 2000 }), []);
-    assert.deepEqual(Core.commentWallFindings([], 'x', { hidden: true, ageDays: null }), []);
+    const hidden = { hidden: true, reports: [] };
+
+    assert.deepEqual(Core.commentWallFindings(hidden, { ageDays: 20 }), [{ level: 'warning', code: 'commentsHidden' }]);
+    assert.deepEqual(Core.commentWallFindings(hidden, { ageDays: 2000 }), []);
+    assert.deepEqual(Core.commentWallFindings(hidden, { ageDays: null }), []);
 });
 
-// ----- signing in through Steam -----
+// Signing in through Steam
 
 test('loginCheck names the site and trusts known trading sites', () => {
-    assert.deepEqual(Core.loginCheck('https://backpack.tf/', 'https://backpack.tf/login/'),
+    assert.deepEqual(Core.loginCheck({ realm: 'https://backpack.tf/', returnTo: 'https://backpack.tf/login/' }),
         { host: 'backpack.tf', level: 'ok', code: 'loginKnown' });
-    assert.deepEqual(Core.loginCheck('https://example.org/', 'https://example.org/auth'),
+    assert.deepEqual(Core.loginCheck({ realm: 'https://example.org/', returnTo: 'https://example.org/auth' }),
         { host: 'example.org', level: 'warning', code: 'loginUnknown' });
-    assert.equal(Core.loginCheck('', ''), null);
+    assert.equal(Core.loginCheck({ realm: '', returnTo: '' }), null);
 });
 
 test('loginCheck catches lookalike sites, mismatched return addresses and disguised hosts', () => {
-    assert.deepEqual(Core.loginCheck('https://backpack-tf.com/', 'https://backpack-tf.com/login'),
+    assert.deepEqual(Core.loginCheck({ realm: 'https://backpack-tf.com/', returnTo: 'https://backpack-tf.com/login' }),
         { host: 'backpack-tf.com', level: 'danger', code: 'loginLookalike', imitates: 'backpack.tf' });
-    assert.deepEqual(Core.loginCheck('https://backpack.tf/', 'https://evil.example/cb'),
+    assert.deepEqual(Core.loginCheck({ realm: 'https://backpack.tf/', returnTo: 'https://evil.example/cb' }),
         { host: 'evil.example', level: 'danger', code: 'loginMismatch', realmHost: 'backpack.tf' });
-    assert.equal(Core.loginCheck('https://backpack.tf', 'https://backpack.tf@evil.example/').code, 'loginMismatch');
+    assert.equal(Core.loginCheck({ realm: 'https://backpack.tf', returnTo: 'https://backpack.tf@evil.example/' }).code, 'loginMismatch');
 
     // malformed punycode that URL() rejects must not slip through
-    assert.equal(Core.loginCheck(null, 'https://xn--stamcommunity-r8i.com/x').code, 'loginLookalike');
+    assert.equal(Core.loginCheck({ realm: null, returnTo: 'https://xn--stamcommunity-r8i.com/x' }).code, 'loginLookalike');
 });
 
-// ----- verified bots and reports -----
+// Verified bots and reports
 
 test('parseBotList reads pasted lists, profile links and exports', () => {
     const pasted = [
@@ -697,7 +722,7 @@ test('parseBotList reads pasted lists, profile links and exports', () => {
         'not an id',
         '76561198000000302 duplicate',
         '7656119800000030 too short'
-    ].join(String.fromCharCode(10));
+    ].join(NL);
 
     assert.deepEqual(Core.parseBotList(pasted), [
         { steamId: '76561198000000302', name: 'STN Trading Bot #2' },
@@ -712,7 +737,7 @@ test('parseBotList reads pasted lists, profile links and exports', () => {
 const VERIFIED_BOT = { steamId: '76561198000000302', name: 'STN Trading Bot #2', avatarHash: null, source: 'verified' };
 
 test('assessPartner flags a copy of a verified bot even on first contact', () => {
-    const copy = Core.assessPartner(profile({ name: 'STN Trading Bot #2' }), [VERIFIED_BOT], { now: NOW });
+    const copy = assess(profile({ name: 'STN Trading Bot #2' }), [VERIFIED_BOT], { now: NOW });
 
     assert.deepEqual(codes(copy), ['impostorVerifiedBot']);
     assert.equal(Core.worstLevel(copy.findings), 'danger');
@@ -720,10 +745,10 @@ test('assessPartner flags a copy of a verified bot even on first contact', () =>
 
 test('assessPartner trusts the verified bot itself and its numbered siblings', () => {
     const contacts = [VERIFIED_BOT, { ...VERIFIED_BOT, steamId: '76561198000000303' }];
-    const real = Core.assessPartner(profile({ steamId: VERIFIED_BOT.steamId, name: 'STN Trading Bot #2' }), contacts, { now: NOW });
+    const real = assess(profile({ steamId: VERIFIED_BOT.steamId, name: 'STN Trading Bot #2' }), contacts, { now: NOW });
     assert.deepEqual(codes(real), ['verifiedBot']);
 
-    const sibling = Core.assessPartner(profile({ name: 'STN Trading Bot #7' }), [VERIFIED_BOT], { now: NOW });
+    const sibling = assess(profile({ name: 'STN Trading Bot #7' }), [VERIFIED_BOT], { now: NOW });
     assert.deepEqual(codes(sibling), []);
 });
 
@@ -735,7 +760,7 @@ test('reportText lays out who, whom and what for a report form', () => {
         offerId: '7001',
         when: NOW
     });
-    const lines = text.split(String.fromCharCode(10));
+    const lines = text.split(NL);
 
     assert.equal(lines[0], 'Scam attempt report');
     assert.ok(lines.includes('Scammer: "Kiro" (SteamID64 76561199950000042) https://steamcommunity.com/profiles/76561199950000042'));
@@ -748,4 +773,117 @@ test('reportText lays out who, whom and what for a report form', () => {
         scammer: { steamId: '1', name: 'x' }, impersonated: null, evidence: [], when: NOW
     });
     assert.ok(!minimal.includes('Impersonating') && !minimal.includes('Trade offer'));
+});
+
+// Regressions found by the thermos review of 0.8.0
+
+test('mergeContacts keeps one entry per account, with every way the user knows it', () => {
+    const contacts = Core.mergeContacts({
+        friends: [{ steamId: '1', name: 'Kiro', avatarHash: 'a'.repeat(40), recent: true }],
+        partners: [{ steamId: '1', name: 'Kiro (old)', avatarHash: null }, { steamId: '2', name: 'Bot', avatarHash: null }],
+        bots: [{ steamId: '2', name: 'STN Trading Bot #2' }]
+    });
+
+    assert.deepEqual(contacts.map((c) => [c.steamId, c.names, Boolean(c.friend), c.partner, c.verified]), [
+        ['1', ['Kiro', 'Kiro (old)'], true, true, false],
+        ['2', ['Bot', 'STN Trading Bot #2'], false, true, true]
+    ]);
+    assert.equal(contacts[0].friend.recent, true);
+    assert.equal(contacts[1].listedName, 'STN Trading Bot #2');
+});
+
+test('a copy of a verified bot you also traded with gets one clear verdict', () => {
+    const bot = { steamId: '76561198000000302', name: 'STN Trading Bot #2', avatarHash: null };
+    const copy = assess(profile({ name: 'STN Trading Bot #2' }), [{ ...bot, source: 'partner' }, { ...bot, source: 'verified' }], { now: NOW });
+
+    assert.deepEqual(copy.findings.map((f) => f.level + ':' + f.code), ['danger:impostorVerifiedBot']);
+});
+
+test('an ID on the verified list still gets caught copying a friend', () => {
+    const kiro = { steamId: '76561198000000301', name: 'Kiro', avatarHash: 'a'.repeat(40), source: 'friend' };
+    const listed = { steamId: '76561198000000555', name: 'Old bot', avatarHash: null, source: 'verified' };
+    const copy = profile({ steamId: listed.steamId, name: 'Kiro', avatarHash: 'a'.repeat(40) });
+    const result = assess(copy, [kiro, listed], { now: NOW });
+
+    assert.deepEqual(codes(result).sort(), ['impostorFriend', 'verifiedBot', 'verifiedBotRenamed']);
+    assert.equal(Core.worstLevel(result.findings), 'danger');
+});
+
+test('a verified bot named differently from its listing gets a warning', () => {
+    const listed = { steamId: '76561198000000302', name: 'STN Trading Bot #2', avatarHash: null, source: 'verified' };
+
+    assert.deepEqual(codes(assess(profile({ steamId: listed.steamId, name: 'STN Trading Bot #2' }), [listed], { now: NOW })),
+        ['verifiedBot']);
+    assert.deepEqual(codes(assess(profile({ steamId: listed.steamId, name: 'gift4u' }), [listed], { now: NOW })),
+        ['verifiedBot', 'verifiedBotRenamed']);
+});
+
+test('assessPartner weighs the trade hold and the comment wall as evidence', () => {
+    const bot = profile({ name: 'STN Trading Bot #3' });
+    const reports = ['1', '2', '3'].map((authorId) => ({ authorId, text: 'scammer' }));
+    const wall = { hidden: false, reports };
+
+    assert.deepEqual(codes(assess(bot, [], { now: NOW, escrow: { mine: 0, theirs: 15 } })), ['botWithHold']);
+    assert.equal(assess(profile(), [], { now: NOW, commentWall: wall }).findings[0].level, 'danger');
+
+    // several people calling a long-standing friend a scammer is worth a look, not a red verdict
+    const friend = { steamId: '76561198000000099', name: 'Someone', avatarHash: null, source: 'friend' };
+    const onFriend = assess(profile(), [friend], { now: NOW, commentWall: wall });
+    assert.equal(onFriend.findings.find((f) => f.code === 'scamReports').level, 'warning');
+});
+
+test('assessPartner says when optional evidence could not be read', () => {
+    const result = assess(profile(), [], { now: NOW, aliases: null, commentWall: null });
+
+    assert.deepEqual(result.findings.map((f) => f.level + ':' + f.code), ['info:aliasesUnchecked', 'info:commentsUnchecked']);
+    assert.deepEqual(codes(assess(profile(), [], { now: NOW })), []); // not applicable is not missing
+});
+
+test('isScamReport reads the most common warnings, and still not praise', () => {
+    for (const text of ['do not trade with him', 'never trade with this guy, he scams', "don't trade", 'scams people']) {
+        assert.equal(Core.isScamReport(text), true, text);
+    }
+    for (const text of ['+rep not a scammer', 'never scammed me, legit', 'no fake items, all good']) {
+        assert.equal(Core.isScamReport(text), false, text);
+    }
+});
+
+test('loginCheck fails closed on a request Steam could read two ways', () => {
+    const ok = { realm: 'https://backpack.tf/', returnTo: 'https://backpack.tf/login/' };
+
+    assert.equal(Core.loginCheck({ ...ok, ambiguous: true }).code, 'loginAmbiguous');
+    assert.equal(Core.loginCheck({ ...ok, ambiguous: true }).host, 'backpack.tf');
+    assert.equal(Core.loginCheck({ realm: 'https://backpack.tf/', returnTo: '//evil.example/cb' }).code, 'loginAmbiguous');
+    assert.equal(Core.loginCheck({ realm: 'https://backpack.tf/', returnTo: null }).code, 'loginAmbiguous');
+    assert.equal(Core.loginCheck({ realm: null, returnTo: null }), null);
+});
+
+test('parseBotList takes a bare SteamID, a single object, and rejects rounded numeric IDs', () => {
+    assert.deepEqual(Core.parseBotList('76561198000000302'), [{ steamId: '76561198000000302', name: '' }]);
+    assert.deepEqual(Core.parseBotList('{"steamId": "76561198000000302", "name": "X"}'),
+        [{ steamId: '76561198000000302', name: 'X' }]);
+    assert.deepEqual(Core.parseBotList('{"bots": [{"steamId": 76561198000000302, "name": "X"}]}'), []);
+});
+
+test('mergeBotList adds only new bots and stamps them', () => {
+    const existing = [{ steamId: '76561198000000302', name: 'A', addedAt: 1 }];
+    const { list, added } = Core.mergeBotList(existing, '76561198000000302 A\n76561198000000303 B', 99);
+
+    assert.equal(added, 1);
+    assert.deepEqual(list, [existing[0], { steamId: '76561198000000303', name: 'B', addedAt: 99 }]);
+});
+
+test('cleanPhrase drops invisible characters, collapses spaces and keeps 40 characters', () => {
+    assert.equal(Core.cleanPhrase(`  [TF2]${cp(0x200B)}   blue\tfalcon  `), '[TF2] blue falcon');
+    assert.equal(Core.cleanPhrase('x'.repeat(50)).length, 40);
+    assert.equal(Core.cleanPhrase(null), '');
+});
+
+test('receivedItemFindings reports any item it could not describe', () => {
+    const metal = { appid: '440', description: { name: 'Refined Metal', market_hash_name: 'Refined Metal' } };
+
+    assert.deepEqual(Core.receivedItemFindings([metal]), []);
+    assert.deepEqual(Core.receivedItemFindings([metal, { appid: '440', description: null }]).map((f) => f.code), ['itemsUnchecked']);
+    assert.deepEqual(Core.receivedItemFindings([metal], { truncated: true }).map((f) => f.code), ['itemsUnchecked']);
+    assert.deepEqual(Core.receivedItemFindings([{ appid: null, description: null }]).map((f) => f.code), ['itemsUnchecked']);
 });
