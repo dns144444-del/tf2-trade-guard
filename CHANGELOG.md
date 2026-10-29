@@ -37,7 +37,11 @@ and versions follow [Semantic Versioning](https://semver.org/).
   `GM_listValues` and `GM_deleteValue` (*Forget everything*). Still no requests outside steamcommunity.com.
 - Each account the user knows is now one contact, whether it's a friend, a past partner, a verified bot or
   all three, so it gets one consistent verdict.
-- Reports are written in the third person and never say who the user's friends are.
+- Reports are written in the third person and never say who the user's friends are. A finding goes into a
+  report only once it has public wording, so a new kind of alert can't leak into one by default.
+- In the trade window, alerts about the items being added join the panel's list, and anything that turns
+  the panel red brings the report buttons with it.
+- When a trade's hold times or a profile's name history and comments can't be read, the panel says so.
 - Several people calling a long-standing friend or a verified bot a scammer is a warning, not a red verdict.
 - *Forget everything* keeps when each friend was first seen, so a reset can't turn a recent friend into a
   trusted one.
@@ -57,6 +61,13 @@ Found by an independent review of this release before it was published, and fixe
 - Pasting a single SteamID into the verified list added nothing, and numeric IDs in a JSON list were
   rounded to a different account.
 - A partner's private inventory was requested again for every item added to an offer.
+- A sign-in request could hide a second return address behind a spelling Steam's server treats as the same
+  parameter (`openid.return.to`, a leading space, `[`, a NUL byte). Every such spelling is now read as
+  ambiguous and shown red.
+- A verified bot sharing its name with an unlisted account the user had traded with was flagged red. The
+  listed bot now gets a warning instead.
+- A verified bot whose profile failed to load was reported as renamed.
+- Scam warnings typed with a phone's curly apostrophe ("don’t trade") went unnoticed.
 
 ## [0.7.2] - 2026-10-29
 

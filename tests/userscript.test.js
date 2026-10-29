@@ -18,10 +18,10 @@ const SELF = '76561198000000001';
 const KIRO = '76561198000000301';
 const NONCE = '0123456789abcdef0123456789abcdef';
 
-// the partner's public profile, as Steam's ?xml=1 returns it
-const profileXml = (name) => `<?xml version="1.0" encoding="UTF-8"?>
+// a partner's public profile, as Steam's ?xml=1 returns it
+const profileXml = (name, steamId) => `<?xml version="1.0" encoding="UTF-8"?>
 <profile>
-  <steamID64>${KIRO}</steamID64>
+  <steamID64>${steamId}</steamID64>
   <steamID><![CDATA[${name}]]></steamID>
   <privacyState>public</privacyState>
   <tradeBanState>None</tradeBanState>
@@ -60,23 +60,46 @@ const SIGNED_OUT_PAGE = '<html><head><script>g_steamID = false;</script></head><
 // the trade window of a "bot" whose items would be held: its owner has no mobile authenticator
 const HELD_BOT_WINDOW = fixture('trade-window.html').replace('g_daysTheirEscrow = 0', 'g_daysTheirEscrow = 15');
 
+// the incoming offers, signed in: Kiro's pending offer with a fake link, a held offer, and one with no partner
+const OFFERS_PAGE = `<html><head><script>g_steamID = "${SELF}";</script></head><body>${fixture('offers.html')}</body></html>`;
+
+// an offer in the user's history from an account they don't know, with exactly the items of Kiro's offer
+const COPIED_OFFER = `<div class="tradeoffer" id="tradeofferid_4001">
+  <div class="tradeoffer_partner"><div class="playerAvatar" data-miniprofile="39734576">
+    <a href="https://steamcommunity.com/profiles/76561198000000304"><img src="x_medium.jpg"></a>
+  </div></div>
+  <div class="tradeoffer_items_ctn inactive">
+    <div class="tradeoffer_items primary"><div class="tradeoffer_item_list">
+      <div class="trade_item" data-economy-item="classinfo/440/8092858113/74041787"></div>
+      <div class="trade_item" data-economy-item="classinfo/440/101785959/11040578"></div>
+    </div></div>
+    <div class="tradeoffer_items secondary"><div class="tradeoffer_item_list">
+      <div class="trade_item" data-economy-item="classinfo/440/2674/0"></div>
+    </div></div>
+  </div>
+</div>`;
+
 // What each same-origin request gets; anything else fails, like a Steam error would.
-// profileName: null makes the partner's profile fail to load.
-function steamResponses({ apiKeyPage, profileName }) {
+// profileName: null makes the partner's profile fail to load; offerHistory: the user's past received offers.
+function steamResponses({ apiKeyPage, profileName, offerHistory }) {
     return [
         [/^\/dev\/apikey/, apiKeyPage],
         [/^\/my\/friends\//, fixture('friends.html')],
-        [/^\/profiles\/\d+\/\?xml=1/, profileName === null ? null : profileXml(profileName)],
+        [/^\/profiles\/\d+\/\?xml=1/, profileName === null ? null : (url) => profileXml(profileName, url.split('/')[2])],
         [/^\/profiles\/\d+\/ajaxaliases\//, '[]'],
+        [/^\/profiles\/\d+\/tradeoffers\/\?history=1/, offerHistory],
+        [/^\/profiles\/\d+\/tradeoffers\/sent\//, '<div></div>'],
         [/^\/inventory\/76561198000000301\/440\/2/, INVENTORY]
     ].filter(([, body]) => body !== null);
 }
 
 // page: a fixture name or raw HTML
-// options: { pathname, search, hash } of the page, Steam's answers ({ apiKeyPage, profileName }), values
-// already stored, answers to prompt() and confirm(), and `until` (a selector) or `settle` (ms) to wait
+// options: { pathname, search, hash } of the page, Steam's answers ({ apiKeyPage, profileName, offerHistory }),
+// values already stored, answers to prompt() and confirm(), and `until` (a selector) or `settle` (ms) to wait
 async function runOn(page, options) {
-    const defaults = { search: '', hash: '', apiKeyPage: NO_KEY_PAGE, profileName: 'Kiro', stored: {}, settle: 0 };
+    const defaults = {
+        search: '', hash: '', apiKeyPage: NO_KEY_PAGE, profileName: 'Kiro', offerHistory: '<div></div>', stored: {}, settle: 0
+    };
     const settings = { ...defaults, ...options };
     const { window, document } = parseHTML(page.endsWith('.html') ? fixture(page) : page);
     const responses = steamResponses(settings);
@@ -121,7 +144,9 @@ async function runOn(page, options) {
             run.requests.push(target);
             const match = responses.find(([pattern]) => pattern.test(target));
             if (!match) return { ok: false, status: 404, url: target, text: async () => '' };
-            return { ok: true, status: 200, url: `https://steamcommunity.com${target}`, text: async () => match[1] };
+
+            const body = typeof match[1] === 'function' ? match[1](target) : match[1];
+            return { ok: true, status: 200, url: `https://steamcommunity.com${target}`, text: async () => body };
         }
     });
 
@@ -155,13 +180,16 @@ test('the trade window gets a panel for the partner, and only same-origin reques
 });
 
 test('the trade window flags a fake Unusual the partner adds, reading each game\'s inventory once', async () => {
-    const { document, requests } = await runOn('trade-window.html', { pathname: '/tradeoffer/new/', until: '.tg-live li' });
+    const { document, requests } = await runOn('trade-window.html', { pathname: '/tradeoffer/new/', until: '.tg-report' });
     const panel = document.querySelector('.tg-panel');
-    const live = [...document.querySelectorAll('.tg-live li')].map((li) => li.textContent);
+    const findings = [...panel.querySelectorAll('li')].map((li) => li.textContent);
 
     assert.match(document.querySelector('.tg-counts').textContent, /^You give 1 item\(s\) . You get 3 item\(s\)$/);
-    assert.match(live[0], /"Team Captain" renamed ''Unusual Burning Flames Team Captain''/);
-    assert.match(live[1], /couldn't check every item/); // the CS2 inventory isn't served
+    assert.match(findings[0], /"Team Captain" renamed ''Unusual Burning Flames Team Captain''/);
+    assert.ok(findings.some((text) => /couldn't check every item/.test(text))); // the CS2 inventory isn't served
+
+    // a verdict the items turned red gets the same level, verdict and report buttons as any other
+    assert.equal(panel.dataset.level, 'danger');
     assert.ok(panel.classList.contains('tg-danger'));
     assert.equal(panel.querySelector('.tg-verdict').textContent, 'DANGER: likely scam');
 
@@ -200,9 +228,34 @@ test('the trade window tells what the Steam confirmation must show, and never pr
 
     assert.match(document.querySelector('.tg-confirm').textContent,
         /the confirmation must show "Kiro" and an account that's 11 year\(s\) old/);
-    assert.equal(panel.dataset.level, 'ok');
-    assert.equal(document.querySelector('.tg-report'), null); // nothing to report on a friend
     assert.doesNotMatch(panel.textContent, /null|undefined/);
+});
+
+test('a trade window whose hold times can\'t be read says so', async () => {
+    const page = fixture('trade-window.html').replace('var g_daysTheirEscrow = 0;', '');
+    const { document } = await runOn(page, { pathname: '/tradeoffer/new/', until: '.tg-confirm' });
+
+    assert.match(document.querySelector('.tg-panel').textContent, /Couldn't read this trade's hold times/);
+});
+
+// Offer lists
+
+test('the offer list checks each offer: a copied offer, a fake link, and a partner it can\'t identify', async () => {
+    const run = await runOn(OFFERS_PAGE, {
+        pathname: `/profiles/${SELF}/tradeoffers/`,
+        offerHistory: COPIED_OFFER,
+        until: '#tradeofferid_5003 .tg-panel li'
+    });
+    const panel = (id) => run.document.querySelector(`#tradeofferid_${id} .tg-panel`);
+
+    assert.equal(panel('5001').dataset.level, 'danger');
+    assert.match(panel('5001').textContent, /Link to a FAKE site: backpack-tf\.com \(imitates backpack\.tf\)/);
+    assert.match(panel('5001').textContent, /Another account \(76561198000000304\) recently had an offer with exactly/);
+    assert.ok(panel('5001').querySelector('.tg-report'));
+    assert.match(panel('5003').textContent, /couldn't identify the other account/);
+
+    // the history is read once for the whole list, not once per offer
+    assert.equal(run.requests.filter((url) => url.endsWith('/tradeoffers/?history=1')).length, 1);
 });
 
 test('without a profile, the reminder doesn\'t make up a name', async () => {

@@ -752,29 +752,6 @@ test('assessPartner trusts the verified bot itself and its numbered siblings', (
     assert.deepEqual(codes(sibling), []);
 });
 
-test('reportText lays out who, whom and what for a report form', () => {
-    const text = Core.reportText({
-        scammer: { steamId: '76561199950000042', name: 'Kiro' },
-        impersonated: { steamId: '76561198000000301', name: 'Kiro' },
-        evidence: ['Impersonating your friend', 'New account'],
-        offerId: '7001',
-        when: NOW
-    });
-    const lines = text.split(NL);
-
-    assert.equal(lines[0], 'Scam attempt report');
-    assert.ok(lines.includes('Scammer: "Kiro" (SteamID64 76561199950000042) https://steamcommunity.com/profiles/76561199950000042'));
-    assert.ok(lines.includes('Impersonating: "Kiro" (SteamID64 76561198000000301) https://steamcommunity.com/profiles/76561198000000301'));
-    assert.ok(lines.includes('Trade offer: 7001'));
-    assert.ok(lines.includes('Date: 2026-10-29'));
-    assert.ok(lines.includes('- New account'));
-
-    const minimal = Core.reportText({
-        scammer: { steamId: '1', name: 'x' }, impersonated: null, evidence: [], when: NOW
-    });
-    assert.ok(!minimal.includes('Impersonating') && !minimal.includes('Trade offer'));
-});
-
 // Regressions found by the thermos review of 0.8.0
 
 test('mergeContacts keeps one entry per account, with every way the user knows it', () => {
@@ -833,9 +810,10 @@ test('assessPartner weighs the trade hold and the comment wall as evidence', () 
 });
 
 test('assessPartner says when optional evidence could not be read', () => {
-    const result = assess(profile(), [], { now: NOW, aliases: null, commentWall: null });
+    const result = assess(profile(), [], { now: NOW, unavailable: ['aliases', 'commentWall', 'escrow'] });
 
-    assert.deepEqual(result.findings.map((f) => f.level + ':' + f.code), ['info:aliasesUnchecked', 'info:commentsUnchecked']);
+    assert.deepEqual(result.findings.map((f) => f.level + ':' + f.code),
+        ['info:aliasesUnchecked', 'info:commentsUnchecked', 'info:escrowUnchecked']);
     assert.deepEqual(codes(assess(profile(), [], { now: NOW })), []); // not applicable is not missing
 });
 
@@ -886,4 +864,54 @@ test('receivedItemFindings reports any item it could not describe', () => {
     assert.deepEqual(Core.receivedItemFindings([metal, { appid: '440', description: null }]).map((f) => f.code), ['itemsUnchecked']);
     assert.deepEqual(Core.receivedItemFindings([metal], { truncated: true }).map((f) => f.code), ['itemsUnchecked']);
     assert.deepEqual(Core.receivedItemFindings([{ appid: null, description: null }]).map((f) => f.code), ['itemsUnchecked']);
+});
+
+// Regressions found by the second thermos review of 0.8.0
+
+test('a verified bot that shares its name with an unlisted partner is not called an impostor', () => {
+    const unlisted = { steamId: '76561198000000303', name: 'STN Trading Bot #2', avatarHash: null, source: 'partner' };
+    const real = profile({ steamId: VERIFIED_BOT.steamId, name: 'STN Trading Bot #2', memberSince: 'October 1, 2026' });
+    const result = assess(real, [VERIFIED_BOT, unlisted], { now: NOW });
+
+    assert.deepEqual(result.findings.map((f) => f.level + ':' + f.code).filter((c) => c !== 'warning:newAccount'),
+        ['info:verifiedBot', 'warning:samePartnerName']);
+});
+
+test('a verified bot whose profile could not load is not called renamed', () => {
+    const fallback = Core.fallbackProfile(VERIFIED_BOT.steamId, null);
+    const result = assess(fallback, [VERIFIED_BOT], { now: NOW, unavailable: ['profile'] });
+
+    assert.ok(!codes(result).includes('verifiedBotRenamed'));
+    assert.ok(codes(result).includes('profileError'));
+});
+
+test('an impersonation names the account it copies, for the report', () => {
+    const copy = assess(profile({ name: FRIEND.name, avatarHash: FRIEND.avatarHash }), [FRIEND], { now: NOW });
+    const finding = copy.findings.find((f) => f.impersonates);
+
+    assert.equal(finding.code, 'impostorFriend');
+    assert.deepEqual(finding.contact, { steamId: FRIEND.steamId, name: FRIEND.name });
+});
+
+test('isScamReport reads a phone keyboard\'s curly apostrophe', () => {
+    assert.equal(Core.isScamReport(`don${cp(0x2019)}t trade with him`), true);
+});
+
+test('offerFindings leaves the user\'s own message out, and checks everything else', () => {
+    const offer = { give: [], get: ['a'], message: 'add me steamcommunity.com.ru', messageLinks: [] };
+    const recent = { offers: [], complete: false };
+
+    assert.deepEqual(Core.offerFindings(offer, { recent }).map((f) => f.code), ['mirrorUnavailable', 'phishingLink']);
+    assert.deepEqual(Core.offerFindings(offer, { isSent: true }).map((f) => f.code), []);
+    assert.deepEqual(Core.giftFinding(2, 0).map((f) => f.code), ['giftOffer']);
+    assert.deepEqual(Core.giftFinding(0, 0), []);
+});
+
+test('mirrorFindings names the account the offer was copied from', () => {
+    const original = { offerId: '1', partnerId: '76561198000000301', give: ['x'], get: ['y'] };
+    const copy = { offerId: '2', partnerId: '76561199950000042', give: ['x'], get: [] };
+    const [finding] = Core.mirrorFindings(copy, { offers: [original], complete: true }, [], () => 'Kiro');
+
+    assert.equal(finding.code, 'mirrorOffer');
+    assert.deepEqual(finding.other, { partnerId: original.partnerId, partnerName: 'Kiro' });
 });

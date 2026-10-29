@@ -72,7 +72,7 @@ test('parseFriends reads SteamIDs, names without the status line, and avatars', 
     assert.deepEqual(friends.map((f) => f.name), ['Kiro', 'Mann Co. Bot #2', `Pyr${cp(0x043E)}cat & co`]);
     assert.equal(friends[0].avatarHash, 'a'.repeat(40));
     assert.equal(friends[1].avatarHash, null); // Steam's default avatar proves nothing
-    assert.ok(friends.every((f) => f.source === 'friend'));
+    assert.deepEqual(Object.keys(friends[0]).sort(), ['avatarHash', 'name', 'steamId']);
 });
 
 test('parseFriends keeps lookalike letters for the impostor checks to find', () => {
@@ -173,14 +173,36 @@ test('route marks a sign-in request that could be read two ways as ambiguous', (
     assert.equal(ambiguous('/openid/login', ok), false);
 });
 
+test('route treats every key PHP would file as an OpenID parameter as one, however it is spelled', () => {
+    const ok = '?openid.realm=https%3A%2F%2Fbackpack.tf%2F&openid.return_to=https%3A%2F%2Fbackpack.tf%2Flogin%2F';
+    const evil = 'https%3A%2F%2Fevil.example%2F';
+    const ambiguous = (search) => Page.route('/openid/login', search).ambiguous;
+
+    // PHP drops leading spaces, cuts a key at a NUL, and files ' ', '.' and '[' as '_'
+    for (const key of ['openid.return.to', 'openid+return_to', 'openid%20return_to', '+openid.return_to',
+        'openid[return_to', 'openid.return_to%00x', 'openid_return_to']) {
+        assert.equal(ambiguous(`${ok}&${key}=${evil}`), true, key);
+    }
+
+    const goto = (target) => `?goto=${encodeURIComponent(target)}`;
+    assert.equal(Page.route('/openid/loginform/', `${goto(`/openid/login${ok}`)}&+goto=%2Fx`).ambiguous, true);
+
+    // a real request also carries the other openid.* fields, which never collide
+    const sreg = `${ok}&openid.mode=checkid_setup&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0` +
+        '&openid.ns.sreg=http%3A%2F%2Fopenid.net%2Fextensions%2Fsreg%2F1.1';
+    assert.equal(ambiguous(sreg), false);
+});
+
 test('route only asks for the report guide on a profile, with a nonce', () => {
     const nonce = '0123456789abcdef0123456789abcdef';
 
-    assert.deepEqual(Page.route('/profiles/76561198000000301/', '', `#tradeguard-report-${nonce}`).reportGuide,
-        { steamId: '76561198000000301', nonce });
-    assert.equal(Page.route('/profiles/76561198000000301/', '', '#tradeguard-report').reportGuide, null);
-    assert.equal(Page.route('/id/someone/', '', `#tradeguard-report-${nonce}`).reportGuide, null);
-    assert.equal(Page.route('/groups/x', '', `#tradeguard-report-${nonce}`).reportGuide, null);
+    const kind = (pathname, hash) => Page.route(pathname, '', hash).kind;
+
+    assert.deepEqual(Page.route('/profiles/76561198000000301/', '', `#tradeguard-report-${nonce}`),
+        { kind: 'reportGuide', steamId: '76561198000000301', nonce });
+    assert.equal(kind('/profiles/76561198000000301/', '#tradeguard-report'), 'other');
+    assert.equal(kind('/id/someone/', `#tradeguard-report-${nonce}`), 'other');
+    assert.equal(kind('/groups/x', `#tradeguard-report-${nonce}`), 'other');
 });
 
 test('escrowDays only trusts Steam\'s own variable lines, not text that looks like them', () => {
