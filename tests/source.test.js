@@ -1,15 +1,16 @@
 'use strict';
 
-// Invisible and bidirectional characters in source code can hide what the code really does
-// ("Trojan Source"). A security script must stay readable, so they're only allowed as escapes.
+// Checks on the source itself rather than on its behavior:
+// - Invisible and bidirectional characters can hide what the code really does ("Trojan Source").
+//   A security script must stay readable, so they're only allowed as escapes.
+// - The userscript never turns text into HTML. Names, messages and item descriptions come from
+//   other people, so every one of them must reach the page as plain text.
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-
-const ROOT = path.join(__dirname, '..');
-const FILES = ['tf2-trade-guard.user.js', 'tests/core.test.js', 'tests/source.test.js'];
+const { ROOT, projectFiles } = require('./helpers/files');
 
 // [first, last] code points
 const FORBIDDEN = [
@@ -23,9 +24,9 @@ const FORBIDDEN = [
     [0x3164, 0x3164], [0xFE00, 0xFE0F], [0xFEFF, 0xFEFF], [0xFFA0, 0xFFA0]
 ];
 
-for (const file of FILES) {
-    test(`${file} contains no invisible or bidirectional characters`, () => {
-        const lines = fs.readFileSync(path.join(ROOT, file), 'utf8').split('\n');
+for (const file of projectFiles()) {
+    test(`${file.relative} contains no invisible or bidirectional characters`, () => {
+        const lines = fs.readFileSync(file.absolute, 'utf8').split('\n');
         const found = [];
 
         lines.forEach((line, index) => {
@@ -40,3 +41,14 @@ for (const file of FILES) {
         assert.deepEqual(found, []);
     });
 }
+
+test('the userscript never builds HTML from strings', () => {
+    const source = fs.readFileSync(path.join(ROOT, 'tf2-trade-guard.user.js'), 'utf8');
+    // writing markup; reading it (copy.outerHTML) is fine
+    const sinks = /\.(?:inner|outer)HTML\s*\+?=(?!=)|\b(?:insertAdjacentHTML|document\.write(?:ln)?|createContextualFragment)\b/g;
+    const found = source.split('\n').flatMap((line, index) =>
+        (line.match(sinks) || []).map((sink) => `line ${index + 1}: ${sink}`)
+    );
+
+    assert.deepEqual(found, []);
+});
