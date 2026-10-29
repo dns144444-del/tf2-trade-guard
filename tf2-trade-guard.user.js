@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TF2 Trade Guard
 // @namespace    https://github.com/dns144444-del/tf2-trade-guard
-// @version      0.7.1
+// @version      0.7.2
 // @description  Warns about Steam API key scams, impostors, fake items and phishing. Talks only to steamcommunity.com.
 // @author       dns144444-del
 // @license      MIT
