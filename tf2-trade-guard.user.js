@@ -2,7 +2,7 @@
 // @name         TF2 Trade Guard
 // @namespace    https://github.com/dns144444-del/tf2-trade-guard
 // @version      0.7.1
-// @description  Warns about Steam Web API key scams, impostor accounts, fake-named items and phishing links in trade offers. Only talks to steamcommunity.com.
+// @description  Warns about Steam API key scams, impostors, fake items and phishing. Talks only to steamcommunity.com.
 // @author       dns144444-del
 // @license      MIT
 // @homepageURL  https://github.com/dns144444-del/tf2-trade-guard
@@ -18,13 +18,21 @@
 
 'use strict';
 
+// This file has three parts, from most to least testable:
+//   Core           pure detection logic: no DOM, no network. Tested in tests/core.test.js.
+//   Page           reads Steam's pages (offers, friends, trade window, comments): DOM only, no
+//                  network, no storage. Tested against HTML fixtures in tests/page.test.js.
+//   runUserscript  everything that needs the live browser: storage, same-origin requests and the UI.
+
 // ---------------------------------------------------------------------------
-// Core: pure detection logic. No DOM, no network — unit tested in tests/.
+// Core: pure detection logic. No DOM, no network.
 // ---------------------------------------------------------------------------
 const Core = (() => {
     const STEAMID64_BASE = 76561197960265728n;
     const DEFAULT_AVATAR_HASH = 'fef49e7fa7e1997310d705b2a6158ff8dc1cdfeb';
     const DAY_MS = 24 * 60 * 60 * 1000;
+
+    // ----- names: lookalike letters, hidden characters, comparison -----
 
     // Cyrillic/Greek letters that render (almost) like Latin ones, after lowercasing
     const HOMOGLYPHS = {
@@ -218,6 +226,8 @@ const Core = (() => {
         return hash === DEFAULT_AVATAR_HASH ? null : hash;
     }
 
+    // ----- Steam responses read as text: API key page, profile XML -----
+
     // state: 'key' | 'none' | 'logged_out' | 'unknown'
     function parseApiKeyPage(html, finalUrl = '') {
         if (/\/login\b/.test(finalUrl) || /g_steamID\s*=\s*false/.test(html)) {
@@ -269,6 +279,8 @@ const Core = (() => {
             memberSince: xmlTag(xml, 'memberSince')
         };
     }
+
+    // ----- account age: profile dates and SteamID estimates -----
 
     const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
 
@@ -393,6 +405,8 @@ const Core = (() => {
         return null;
     }
 
+    // ----- copied offers -----
+
     // order-independent key for a list of item identifiers
     function itemsKey(items) {
         return [...items].sort().join('|');
@@ -415,6 +429,8 @@ const Core = (() => {
             (offer.get.length === 0 || itemsKey(other.get) === get)
         ) || null;
     }
+
+    // ----- partner assessment -----
 
     // Steam's name history lists the current name first, with the date it was taken:
     // [{ newname: 'Kiro', timechanged: '3 Mar, 2021 @ 2:37pm' }, { newname: 'RocketMan', ... }, ...]
@@ -609,7 +625,8 @@ const Core = (() => {
         const realName = description.market_hash_name || description.market_name || originalName || '';
 
         // only words the item doesn't already earn from its real name and Steam's own lines
-        const genuine = baseNormalize([realName, originalName, ...descriptions.filter((v) => !CUSTOM_TEXT.test(v))].join(' '));
+        const steamLines = descriptions.filter((value) => !CUSTOM_TEXT.test(value));
+        const genuine = baseNormalize([realName, originalName, ...steamLines].join(' '));
         const custom = baseNormalize([customName, customDescription].filter(Boolean).join(' '));
         const claims = VALUE_WORDS.filter((word) => hasWord(custom, word) && !hasWord(genuine, word));
 
@@ -807,8 +824,136 @@ const Core = (() => {
     };
 })();
 
+// ---------------------------------------------------------------------------
+// Page: reads Steam's markup. Takes a document or element, returns plain data.
+// ---------------------------------------------------------------------------
+const Page = (() => {
+    // which guard a page needs; pathname and search as in location
+    function route(pathname, search = '') {
+        const offerList = pathname.match(/^\/(?:id|profiles)\/[^/]+\/tradeoffers(\/sent)?\/?$/);
+        if (offerList) {
+            return { kind: 'offerList', isSent: Boolean(offerList[1]), isHistory: new URLSearchParams(search).has('history') };
+        }
+
+        const tradeWindow = pathname.match(/^\/tradeoffer\/(new|\d+)\/?$/);
+        if (tradeWindow) return { kind: 'tradeWindow', offerId: tradeWindow[1] === 'new' ? null : tradeWindow[1] };
+
+        return { kind: 'other' };
+    }
+
+    // forum threads use the same comment markup, but advice like "contact Steam Support" is normal there
+    function wantsCommentCheck(pathname) {
+        return !pathname.includes('/discussions');
+    }
+
+    // the logged-in account and the trade partner, from the page's inline scripts
+    function selfSteamId(scriptsText) {
+        return (String(scriptsText).match(/g_steamID\s*=\s*"(\d{17})"/) || [])[1] || null;
+    }
+
+    function tradePartnerId(scriptsText) {
+        return (String(scriptsText).match(/g_ulTradePartnerSteamID\s*=\s*['"](\d{17})['"]/) || [])[1] || null;
+    }
+
+    // the name isn't always the block's first text node, so take everything except the status line
+    function friendName(block) {
+        const content = block.querySelector('.friend_block_content');
+        if (!content) return '';
+
+        const copy = content.cloneNode(true);
+        copy.querySelectorAll('.friend_small_text').forEach((node) => node.remove());
+
+        return copy.textContent.replace(/\s+/g, ' ').trim();
+    }
+
+    // /my/friends/
+    function parseFriends(root) {
+        return [...root.querySelectorAll('.friend_block_v2[data-steamid]')].map((block) => ({
+            steamId: block.getAttribute('data-steamid'),
+            name: friendName(block),
+            avatarHash: Core.avatarHash(block.querySelector('.player_avatar img')?.getAttribute('src')),
+            source: 'friend'
+        }));
+    }
+
+    // Steam lays offers out differently (a large partner avatar for pending offers, small per-side
+    // avatars for accepted or held ones), so take whichever account in the offer isn't the user
+    function findPartner(el, selfId) {
+        for (const node of el.querySelectorAll('[data-miniprofile]')) {
+            const accountId = node.getAttribute('data-miniprofile');
+            if (!/^\d+$/.test(accountId || '')) continue;
+
+            const steamId = Core.accountIdToSteamId64(accountId);
+            if (steamId !== selfId) return { steamId, avatarSrc: node.querySelector('img')?.getAttribute('src') || null };
+        }
+
+        return { steamId: null, avatarSrc: null };
+    }
+
+    // works on the live page and on fetched list/history pages, which share the same markup
+    function parseOfferList(root, isSent, selfId) {
+        return [...root.querySelectorAll('.tradeoffer[id^="tradeofferid_"]')].map((el) => {
+            const partner = findPartner(el, selfId);
+            const items = (side) => [...el.querySelectorAll(`.tradeoffer_items.${side} .trade_item`)].map((item) =>
+                item.getAttribute('data-economy-item') || item.querySelector('img')?.getAttribute('src') || '?'
+            );
+            const primary = items('primary');
+            const secondary = items('secondary');
+            const message = el.querySelector('.tradeoffer_message .quote') || el.querySelector('.tradeoffer_message');
+
+            return {
+                el,
+                offerId: el.id.replace('tradeofferid_', ''),
+                partnerId: partner.steamId,
+                partnerAvatar: partner.avatarSrc,
+                give: isSent ? primary : secondary,
+                get: isSent ? secondary : primary,
+                message: message ? message.textContent.trim() : '',
+                messageLinks: message ? [...message.querySelectorAll('a[href]')].map((a) => a.getAttribute('href')) : []
+            };
+        });
+    }
+
+    // the trade window shows items as #item<app>_<context>_<assetid>; null for anything that isn't a
+    // TF2 item, so the caller can say it couldn't check it
+    function theirTradeAssetIds(root) {
+        return [...root.querySelectorAll('#their_slots .item')].map((el) => (el.id.match(/^item440_2_(\d+)$/) || [])[1] || null);
+    }
+
+    // a comment on a profile, group or workshop page
+    function commentParts(comment) {
+        const text = comment.querySelector('.commentthread_comment_text');
+        if (!text) return null;
+
+        // one selector at a time: the avatar link comes first in the markup and has no text, so a combined
+        // selector ('a, b') would return it instead of the author's name
+        const author = comment.querySelector('.commentthread_author_link') ||
+            [...comment.querySelectorAll('.commentthread_comment_author a')].find((a) => a.textContent.trim());
+
+        return {
+            textEl: text,
+            text: text.textContent,
+            hrefs: [...text.querySelectorAll('a[href]')].map((a) => a.getAttribute('href')),
+            author: author ? author.textContent.trim() : ''
+        };
+    }
+
+    return {
+        route,
+        wantsCommentCheck,
+        selfSteamId,
+        tradePartnerId,
+        friendName,
+        parseFriends,
+        findPartner,
+        parseOfferList,
+        theirTradeAssetIds,
+        commentParts
+    };
+})();
+
 if (typeof module !== 'undefined' && module.exports) {
-    module.exports = Core;
+    module.exports = { Core, Page };
 } else {
     runUserscript();
 }
@@ -817,6 +962,8 @@ if (typeof module !== 'undefined' && module.exports) {
 // Userscript: storage, same-origin fetching and UI
 // ---------------------------------------------------------------------------
 function runUserscript() {
+    // ----- setup: limits, strings, storage, helpers -----
+
     const MINUTE = 60 * 1000;
     const HOUR = 60 * MINUTE;
     const DAY = 24 * HOUR;
@@ -1048,32 +1195,16 @@ function runUserscript() {
 
     // ----- contacts: friends + previously seen trade partners -----
 
-    // the name isn't always the block's first text node, so take everything except the status line
-    function friendName(block) {
-        const content = block.querySelector('.friend_block_content');
-        if (!content) return '';
-
-        const copy = content.cloneNode(true);
-        copy.querySelectorAll('.friend_small_text').forEach((node) => node.remove());
-
-        return copy.textContent.replace(/\s+/g, ' ').trim();
-    }
-
-    // bump when friendName() changes, so lists parsed the old way are fetched again
+    // bump when Page.friendName() changes, so lists parsed the old way are fetched again
     const FRIENDS_PARSER_VERSION = 2;
 
     async function getFriends() {
         const cached = store.get('friends', null);
-        if (cached && cached.parser === FRIENDS_PARSER_VERSION && Date.now() - cached.fetchedAt < 6 * HOUR) return cached.list;
+        const fresh = cached && cached.parser === FRIENDS_PARSER_VERSION && Date.now() - cached.fetchedAt < 6 * HOUR;
+        if (fresh) return cached.list;
 
         const { text } = await getText('/my/friends/');
-        const doc = new DOMParser().parseFromString(text, 'text/html');
-        const list = [...doc.querySelectorAll('.friend_block_v2[data-steamid]')].map((block) => ({
-            steamId: block.getAttribute('data-steamid'),
-            name: friendName(block),
-            avatarHash: Core.avatarHash(block.querySelector('.player_avatar img')?.getAttribute('src')),
-            source: 'friend'
-        }));
+        const list = Page.parseFriends(new DOMParser().parseFromString(text, 'text/html'));
 
         // an empty result may mean Steam changed the page, so don't let it stick for hours
         if (list.length) store.set('friends', { list, parser: FRIENDS_PARSER_VERSION, fetchedAt: Date.now() });
@@ -1146,6 +1277,8 @@ function runUserscript() {
         store.set('partners', Object.fromEntries(kept));
     }
 
+    // ----- profiles, name history and learned age anchors -----
+
     function keepNewest(cache, max) {
         return Object.fromEntries(
             Object.entries(cache)
@@ -1206,45 +1339,7 @@ function runUserscript() {
         return aliases;
     }
 
-    // ----- offers: parsing and copied-offer detection -----
-
-    // Steam lays offers out differently (a large partner avatar for pending offers, small per-side
-    // avatars for accepted or held ones), so take whichever account in the offer isn't the user
-    function findPartner(el, selfId) {
-        for (const node of el.querySelectorAll('[data-miniprofile]')) {
-            const accountId = node.getAttribute('data-miniprofile');
-            if (!/^\d+$/.test(accountId || '')) continue;
-
-            const steamId = Core.accountIdToSteamId64(accountId);
-            if (steamId !== selfId) return { steamId, avatarSrc: node.querySelector('img')?.getAttribute('src') || null };
-        }
-
-        return { steamId: null, avatarSrc: null };
-    }
-
-    // works on the live page and on fetched list/history pages, which share the same markup
-    function parseOfferList(root, isSent, selfId) {
-        return [...root.querySelectorAll('.tradeoffer[id^="tradeofferid_"]')].map((el) => {
-            const partner = findPartner(el, selfId);
-            const items = (side) => [...el.querySelectorAll(`.tradeoffer_items.${side} .trade_item`)].map((item) =>
-                item.getAttribute('data-economy-item') || item.querySelector('img')?.getAttribute('src') || '?'
-            );
-            const primary = items('primary');
-            const secondary = items('secondary');
-            const message = el.querySelector('.tradeoffer_message .quote') || el.querySelector('.tradeoffer_message');
-
-            return {
-                el,
-                offerId: el.id.replace('tradeofferid_', ''),
-                partnerId: partner.steamId,
-                partnerAvatar: partner.avatarSrc,
-                give: isSent ? primary : secondary,
-                get: isSent ? secondary : primary,
-                message: message ? message.textContent.trim() : '',
-                messageLinks: message ? [...message.querySelectorAll('a[href]')].map((a) => a.getAttribute('href')) : []
-            };
-        });
-    }
+    // ----- copied-offer detection -----
 
     // History still lists offers that were canceled seconds after arriving, which the user may
     // never have seen — exactly the offers an API-key scam replaces. It's never cached across page
@@ -1271,7 +1366,7 @@ function runUserscript() {
                 const { text } = await getText(path);
                 const doc = new DOMParser().parseFromString(text, 'text/html');
 
-                offers.push(...parseOfferList(doc, isSent, selfId).slice(0, 30).map(({ el, ...offer }) => offer));
+                offers.push(...Page.parseOfferList(doc, isSent, selfId).slice(0, 30).map(({ el, ...offer }) => offer));
                 loaded += 1;
             } catch (error) {
                 log('could not load offers from', path, error);
@@ -1380,7 +1475,7 @@ function runUserscript() {
     }
 
     async function tradeWindowItemFindings(partnerId) {
-        const ids = [...document.querySelectorAll('#their_slots .item')].map((el) => (el.id.match(/^item440_2_(\d+)$/) || [])[1]);
+        const ids = Page.theirTradeAssetIds(document);
         if (!ids.length) return [];
 
         try {
@@ -1425,6 +1520,12 @@ function runUserscript() {
         return [...findings].sort((a, b) => rank[a.level] - rank[b.level]);
     }
 
+    function findingItems(findings, max = Infinity) {
+        return sortBySeverity(findings)
+            .slice(0, max)
+            .map((finding) => h('li', { class: `tg-${finding.level}`, text: findingText(finding) }));
+    }
+
     function renderPanel(panel, profile, findings, ageDays, ageEstimated) {
         const level = Core.worstLevel(findings);
         const id = profile.steamId;
@@ -1447,13 +1548,21 @@ function runUserscript() {
                 h('a', { href: `https://backpack.tf/profiles/${id}`, target: '_blank', rel: 'noopener noreferrer', text: 'backpack.tf' })
             ),
             findings.length
-                ? h('ul', {}, sortBySeverity(findings).slice(0, 6).map((f) => h('li', { class: `tg-${f.level}`, text: findingText(f) })))
+                ? h('ul', {}, findingItems(findings, 6))
                 : null
         );
     }
 
     function profileFallback(steamId, avatarSrc) {
-        return { steamId, name: '', avatarHash: Core.avatarHash(avatarSrc), privacy: 'unknown', tradeBan: 'None', limited: false, memberSince: null };
+        return {
+            steamId,
+            name: '',
+            avatarHash: Core.avatarHash(avatarSrc),
+            privacy: 'unknown',
+            tradeBan: 'None',
+            limited: false,
+            memberSince: null
+        };
     }
 
     async function assessAndRender(panel, steamId, avatarSrc, contacts, selfId, extraFindings = []) {
@@ -1488,14 +1597,14 @@ function runUserscript() {
         return usable;
     }
 
+    // ----- trade offer list -----
+
     // /id/<name>/tradeoffers/ and /tradeoffers/sent/ (plus their ?history=1 views)
-    async function guardOfferList(selfId) {
-        const isSent = /\/tradeoffers\/sent/.test(location.pathname);
-        const offers = parseOfferList(document, isSent, selfId);
+    async function guardOfferList(selfId, { isSent, isHistory }) {
+        const offers = Page.parseOfferList(document, isSent, selfId);
         if (!offers.length) return;
 
         // copies only matter for offers you can still accept, and history would flag the originals
-        const isHistory = new URLSearchParams(location.search).has('history');
         const { contacts, friendsStatus } = await buildContacts();
         const recent = !isSent && !isHistory ? await getRecentOffers(selfId) : null;
 
@@ -1522,11 +1631,14 @@ function runUserscript() {
                 // your own message isn't evidence of anything
                 if (!isSent) extra.push(...Core.analyzeText(offer.message, offer.messageLinks, { unknownLinks: true }));
 
-                const profile = await assessAndRender(panel, offer.partnerId, offer.partnerAvatar, contacts, selfId, extra);
+                const profile = await assessAndRender(
+                    panel, offer.partnerId, offer.partnerAvatar, contacts, selfId, extra
+                );
 
                 // later offers in this same list are compared against this partner too
                 if (!contacts.some((c) => c.steamId === profile.steamId)) {
-                    contacts.push({ steamId: profile.steamId, name: profile.name, avatarHash: profile.avatarHash, source: 'partner' });
+                    const { steamId, name, avatarHash } = profile;
+                    contacts.push({ steamId, name, avatarHash, source: 'partner' });
                 }
             } catch (error) {
                 log('offer check failed', error);
@@ -1543,7 +1655,7 @@ function runUserscript() {
 
         try {
             const { text } = await getText(`/profiles/${selfId}/tradeoffers/`);
-            incoming = parseOfferList(new DOMParser().parseFromString(text, 'text/html'), false, selfId);
+            incoming = Page.parseOfferList(new DOMParser().parseFromString(text, 'text/html'), false, selfId);
         } catch (error) {
             log('incoming offers unavailable', error);
             return [{ level: 'warning', code: 'mirrorUnavailable' }, { level: 'warning', code: 'itemsUnchecked' }];
@@ -1561,25 +1673,25 @@ function runUserscript() {
         ];
     }
 
+    // ----- trade window -----
+
     // /tradeoffer/new/ and /tradeoffer/<id>/
-    async function guardTradeWindow(selfId) {
-        const match = pageScriptsText().match(/g_ulTradePartnerSteamID\s*=\s*['"](\d{17})['"]/);
+    async function guardTradeWindow(selfId, { offerId }) {
+        const partnerId = Page.tradePartnerId(pageScriptsText());
         const hasTradeUi = Boolean(document.querySelector('#your_slots, #their_slots, .trade_area'));
 
         // expired or invalid offers render an error page with neither
-        if (!match && !hasTradeUi) return;
+        if (!partnerId && !hasTradeUi) return;
 
         const panel = h('div', { class: 'tg-panel tg-window' }, T.checking);
         const anchor = document.querySelector('.trade_area') || document.querySelector('#mainContent');
         if (anchor) anchor.before(panel);
         else document.body.prepend(panel);
 
-        if (!match) {
+        if (!partnerId) {
             renderNotice(panel, 'unidentified');
             return;
         }
-
-        const offerId = location.pathname.match(/^\/tradeoffer\/(\d+)/)?.[1];
 
         try {
             const { contacts, friendsStatus } = await buildContacts();
@@ -1588,7 +1700,7 @@ function runUserscript() {
             // a received offer opened directly (e.g. from a notification) gets the same checks as the list
             if (offerId) extra.push(...await receivedOfferFindings(selfId, offerId));
 
-            await assessAndRender(panel, match[1], null, contacts, selfId, extra);
+            await assessAndRender(panel, partnerId, null, contacts, selfId, extra);
         } catch (error) {
             log('trade window check failed', error);
             renderNotice(panel, 'checkFailed');
@@ -1606,7 +1718,8 @@ function runUserscript() {
 
         // the verdict was computed before any items were added, so it must follow the live state
         const refreshVerdict = () => {
-            const level = [panel.dataset.level || 'ok', giftLevel, itemsLevel].reduce((a, b) => (rank[b] > rank[a] ? b : a));
+            const level = [panel.dataset.level || 'ok', giftLevel, itemsLevel]
+                .reduce((worst, next) => (rank[next] > rank[worst] ? next : worst));
             setPanelLevel(panel, level);
 
             const verdict = panel.querySelector('.tg-verdict');
@@ -1615,7 +1728,6 @@ function runUserscript() {
 
         // only a new offer is built live from the partner's inventory; a received offer's items
         // were already checked above
-        const partnerId = match[1];
         const buildingOffer = !offerId;
         let itemCheck = 0;
 
@@ -1625,7 +1737,7 @@ function runUserscript() {
             if (ticket !== itemCheck) return; // a newer change already started another check
 
             itemsLevel = Core.worstLevel(findings);
-            liveItems.replaceChildren(...sortBySeverity(findings).map((f) => h('li', { class: `tg-${f.level}`, text: findingText(f) })));
+            liveItems.replaceChildren(...findingItems(findings));
             refreshVerdict();
         };
 
@@ -1677,18 +1789,15 @@ function runUserscript() {
     function checkComment(comment) {
         comment.dataset.tgChecked = '1';
 
-        const text = comment.querySelector('.commentthread_comment_text');
-        if (!text) return;
+        const parts = Page.commentParts(comment);
+        if (!parts) return;
 
-        const hrefs = [...text.querySelectorAll('a[href]')].map((a) => a.getAttribute('href'));
-        const findings = Core.analyzeText(text.textContent, hrefs);
-
-        const author = comment.querySelector('.commentthread_author_link, .commentthread_comment_author a');
-        if (author && Core.impersonatesStaff(author.textContent)) findings.push({ level: 'danger', code: 'staffComment' });
+        const findings = Core.analyzeText(parts.text, parts.hrefs);
+        if (Core.impersonatesStaff(parts.author)) findings.push({ level: 'danger', code: 'staffComment' });
         if (!findings.length) return;
 
         const level = Core.worstLevel(findings);
-        text.after(h('div', { class: `tg-comment tg-${level}` },
+        parts.textEl.after(h('div', { class: `tg-comment tg-${level}` },
             h('strong', { text: 'Trade Guard: ' }),
             sortBySeverity(findings).map(findingText).join(' ')
         ));
@@ -1725,15 +1834,18 @@ function runUserscript() {
         areas.forEach((area) => observer.observe(area, { childList: true, subtree: true }));
     }
 
+    // ----- styles -----
+
     function injectStyles() {
         GM_addStyle(`
-            #tg-api-banner { position: sticky; top: 0; z-index: 99999; display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
-                padding: 12px 16px; background: #b3261e; color: #fff; font: 600 14px/1.4 "Motiva Sans", Arial, sans-serif;
-                box-shadow: 0 2px 8px rgba(0,0,0,.5); }
+            #tg-api-banner { position: sticky; top: 0; z-index: 99999; display: flex; flex-wrap: wrap; gap: 10px;
+                align-items: center; padding: 12px 16px; background: #b3261e; color: #fff;
+                font: 600 14px/1.4 "Motiva Sans", Arial, sans-serif; box-shadow: 0 2px 8px rgba(0,0,0,.5); }
             #tg-api-banner.tg-unverified { background: #7a5c00; }
             #tg-api-banner span { flex: 1 1 400px; }
-            .tg-btn { padding: 6px 12px; border: 1px solid rgba(255,255,255,.7); border-radius: 3px; background: transparent;
-                color: #fff !important; font: inherit; cursor: pointer; text-decoration: none !important; }
+            .tg-btn { padding: 6px 12px; border: 1px solid rgba(255,255,255,.7); border-radius: 3px;
+                background: transparent; color: #fff !important; font: inherit; cursor: pointer;
+                text-decoration: none !important; }
             .tg-btn-danger { background: #fff; color: #b3261e !important; }
             .tg-panel { margin: 6px 0 8px; padding: 8px 12px; border-left: 4px solid #6b8aaa; border-radius: 3px;
                 background: rgba(0,0,0,.35); color: #c6d4df; font: 13px/1.5 "Motiva Sans", Arial, sans-serif; }
@@ -1759,14 +1871,16 @@ function runUserscript() {
         `);
     }
 
-    async function main() {
-        const selfMatch = pageScriptsText().match(/g_steamID\s*=\s*"(\d{17})"/);
-        if (!selfMatch) return; // logged out
+    // ----- startup -----
 
-        const selfId = selfMatch[1];
+    async function main() {
+        const selfId = Page.selfSteamId(pageScriptsText());
+        if (!selfId) return; // logged out
+
         accountScope = selfId;
 
         const path = location.pathname;
+        const page = Page.route(path, location.search);
         const onTradePage = /\/tradeoffers?(\/|$)/.test(path);
 
         injectStyles();
@@ -1779,14 +1893,10 @@ function runUserscript() {
                 showApiBanner(store.get('apikey', null), true);
             });
 
-        // forum threads use the same comment markup, but advice like "contact Steam Support" is normal there
-        if (!path.includes('/discussions')) guardComments();
+        if (Page.wantsCommentCheck(path)) guardComments();
 
-        if (/^\/(id|profiles)\/[^/]+\/tradeoffers(\/|$)/.test(path)) {
-            await guardOfferList(selfId);
-        } else if (/^\/tradeoffer\/(new|\d+)/.test(path)) {
-            await guardTradeWindow(selfId);
-        }
+        if (page.kind === 'offerList') await guardOfferList(selfId, page);
+        else if (page.kind === 'tradeWindow') await guardTradeWindow(selfId, page);
     }
 
     main().catch((error) => log('error', error));

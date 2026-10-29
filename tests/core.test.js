@@ -2,7 +2,7 @@
 
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
-const Core = require('../tf2-trade-guard.user.js');
+const { Core } = require('../tf2-trade-guard.user.js');
 
 const NOW = new Date('2026-10-29T12:00:00Z');
 const AVATAR_A = 'https://avatars.fastly.steamstatic.com/0123456789abcdef0123456789abcdef01234567_full.jpg';
@@ -250,7 +250,8 @@ test('assessPartner flags an account that used to be named like a friend', () =>
 test('assessPartner does not call two real friends with the same name impostors', () => {
     const soundA = { steamId: '76561198000000201', name: 'sound', avatarHash: 'a'.repeat(40), source: 'friend' };
     const soundB = { steamId: '76561198000000202', name: 'sound', avatarHash: 'b'.repeat(40), source: 'friend' };
-    const result = Core.assessPartner(profile({ steamId: soundA.steamId, name: 'sound', avatarHash: soundA.avatarHash }), [soundA, soundB], { now: NOW });
+    const partner = profile({ steamId: soundA.steamId, name: 'sound', avatarHash: soundA.avatarHash });
+    const result = Core.assessPartner(partner, [soundA, soundB], { now: NOW });
 
     assert.deepEqual(codes(result), ['isFriend', 'sharedIdentity']);
     assert.equal(Core.worstLevel(result.findings), 'warning');
@@ -317,7 +318,8 @@ test('estimateCreationTime is not poisoned by one learned anchor dated far too l
 
     // built-in points after the bad one must still be used
     assert.equal(Core.estimateCreationTime(steamIdAt(940500000), NOW, poison), Date.UTC(2019, 1, 5));
-    assert.equal(Core.estimateCreationTime(steamIdAt(500000000), NOW, poison), Core.estimateCreationTime(steamIdAt(500000000), NOW));
+    const bad = steamIdAt(500000000);
+    assert.equal(Core.estimateCreationTime(bad, NOW, poison), Core.estimateCreationTime(bad, NOW));
 });
 
 function profile(overrides) {
@@ -399,14 +401,16 @@ test('assessPartner treats an old, public account with a past partner\'s name as
 test('assessPartner does not give a recently added friend the benefit of the doubt', () => {
     const realKiro = { steamId: '76561198000000301', name: 'Kiro', avatarHash: 'a'.repeat(40), source: 'friend' };
     const newKiro = { steamId: '76561199900000000', name: 'Kiro', avatarHash: 'b'.repeat(40), source: 'friend', recentFriend: true };
-    const result = Core.assessPartner(profile({ steamId: newKiro.steamId, name: 'Kiro' }), [realKiro, newKiro], { now: NOW });
+    const partner = profile({ steamId: newKiro.steamId, name: 'Kiro' });
+    const result = Core.assessPartner(partner, [realKiro, newKiro], { now: NOW });
 
     assert.deepEqual(codes(result).sort(), ['impostorFriend', 'isFriend', 'recentFriend']);
     assert.equal(Core.worstLevel(result.findings), 'danger');
 });
 
 test('assessPartner treats the real friend as safe', () => {
-    const result = Core.assessPartner(profile({ steamId: FRIEND.steamId, name: FRIEND.name, avatarHash: FRIEND.avatarHash }), [FRIEND], { now: NOW });
+    const partner = profile({ steamId: FRIEND.steamId, name: FRIEND.name, avatarHash: FRIEND.avatarHash });
+    const result = Core.assessPartner(partner, [FRIEND], { now: NOW });
 
     assert.deepEqual(codes(result), ['isFriend']);
     assert.equal(Core.worstLevel(result.findings), 'ok');
