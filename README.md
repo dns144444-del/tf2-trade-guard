@@ -13,7 +13,9 @@ A userscript that protects Steam traders from the scams that empty the most TF2 
 
 ![The API key banner, and a phishing comment flagged on a profile](docs/screenshots/api-key-and-comments.png)
 
-*The real script running on a simulated Steam page, with fictional accounts.*
+![A "Sign in through Steam" page for a lookalike of backpack.tf, flagged in red](docs/screenshots/sign-in.png)
+
+*The real script running on a simulated Steam page, with fictional accounts. "blue falcon" is the example secret phrase.*
 
 ## What it does
 
@@ -35,6 +37,21 @@ A userscript that protects Steam traders from the scams that empty the most TF2 
 - **Fake-named items:** checks every item you'd receive for a Name Tag or Description Tag and shows its real name. If the custom text claims something the item doesn't have (an unusual effect, Australium, Strange, a key…), the offer is flagged red. In a new offer this updates live as items are added.
 - **Phishing links and scam lines in offer messages:** links to lookalike domains of Steam or trading sites (`steamcommunlty.com`, `backpack-tf.com`, lookalike letters, punycode, `steamcommunity.com@other-site`) are flagged red, other links yellow, and common scam lines ("is this your item?", "vote for my team", "your account will be banned") yellow.
 - **Fake staff:** a partner whose name claims to be Steam or Valve staff ("Steam Support", "Valve Admin") is flagged red. Valve staff never trade.
+- **Bots with a trade hold:** every real trading bot uses the Steam Guard Mobile Authenticator, so its trades are never held. An account that calls itself a bot but whose items would be held is flagged red; any other partner without the authenticator gets a yellow note. (Only judged when your own side of the trade has no hold, since Steam's numbers can't tell the two apart otherwise.)
+- **Items from other games:** an item from another game named like a TF2 key, metal or hat (a Steam or CS2 item passed off as a Mann Co. Supply Crate Key) is flagged red; other cross-game items get a note.
+- **What the community wrote:** reads the partner's profile comments. Warnings from several different people ("scammer", "stole", "impostor", "-rep") raise the alert; praise like "+rep, not a scammer" doesn't count. A new account with its comments hidden gets a yellow note.
+- **Verified bots:** paste the SteamIDs from a trading site's official bot list (menu → *Verified bots*). From then on, any other account using one of those names is flagged red, even on first contact. Lists can be exported and imported as JSON.
+- **Before you confirm:** the trade window reminds you what the Steam app or email confirmation must show: the partner's name and account age.
+- **Report a scammer:** red panels get *Copy report*, *Steam* and *backpack.tf* buttons. Each copies a ready-to-paste report (scammer, who they copied, what was detected) and opens the place to send it. On Steam, the profile shows how to reach *Report Player → Attempted Trade Scam*. Trade Guard never submits anything itself.
+
+**Signing in through Steam** (`steamcommunity.com/openid/...`)
+- Shows which site you're signing in to. Known trading sites get a green bar, unknown sites a yellow one, and lookalike domains or a sign-in that sends you back to a different site a red one. It works before you sign in, on the password form itself.
+
+**Your secret phrase** (menu → *Set secret phrase*)
+- Shown on every Trade Guard panel, banner and sign-in bar. A fake panel written into an offer message, or a fake "Steam login" window drawn inside a phishing site, can't show it: if the phrase is missing, it isn't Trade Guard.
+
+**Security checkup** (menu → *Security checkup*)
+- Your API key status (with *Check now*), your secret phrase, your verified bots, what Trade Guard has stored, and a *Forget everything* button.
 
 **Comments** (profiles, groups, workshop)
 - Comments with lookalike links, scam lines or authors posing as Steam/Valve staff get a warning note. Normal comments are left alone. Forum threads are skipped, where "contact Steam Support" is ordinary advice.
@@ -43,7 +60,8 @@ A userscript that protects Steam traders from the scams that empty the most TF2 
 
 - **Only talks to `steamcommunity.com`.** It makes no request to any other domain, has no `@connect` entries and doesn't use `GM_xmlhttpRequest`.
 - Doesn't read cookies or your session ID, and never sends, accepts or modifies trade offers. It only adds warning panels.
-- Everything it remembers (friends, past trade partners, cached profiles) stays in Tampermonkey's local storage. Data about your account is kept per Steam account, so alts on the same browser never mix.
+- Everything it remembers (friends, past trade partners, cached profiles, your verified bots and secret phrase) stays in Tampermonkey's local storage. Data about your account is kept per Steam account, so alts on the same browser never mix. Of a partner's comments, only the scam warnings are kept. *Forget everything* in the security checkup deletes it all.
+- Its permissions, and what for: storage (`GM_getValue`, `GM_setValue`, `GM_listValues`, `GM_deleteValue`), styles (`GM_addStyle`), the Tampermonkey menu (`GM_registerMenuCommand`), and the clipboard (`GM_setClipboard`), which is only written when you click a report or export button.
 - Names from Steam are inserted as plain text, never as HTML.
 - **It fails loudly.** If a check can't run (Steam changed a page, a request failed, the friends list didn't load), you get a yellow warning instead of a green "No alerts".
 - Trusting your own API key requires typing its domain, so a phishing page can't talk you into a single click.
@@ -64,11 +82,14 @@ The script declares `@downloadURL none`, so Tampermonkey never updates it on its
 ## Limitations
 
 - It warns you, it can't stop you. Always check the items and the partner in the Steam Guard mobile confirmation.
-- Impostor detection only knows your friends and the partners it has seen while installed. A first contact with an impostor of a bot you've never traded with can't be detected by name.
+- Impostor detection only knows your friends, the partners it has seen while installed and your verified bots. A first contact with an impostor of a bot that isn't on your verified list can't be detected by name (a trade hold or a new account may still give it away).
+- The trade-hold check needs your own side of the trade to have no hold; otherwise it stays quiet rather than guess.
+- Comment warnings are a hint, not a verdict: friends joke, and scammers delete comments. Several different people warning is what raises the alert.
+- Steam has no direct link to its report form, so the *Steam* report button opens the profile and explains the three clicks. backpack.tf reports go through its issue tracker.
 - Item checks need Steam to describe each item: in a new offer they read the partner's public inventory, so a private inventory (or Steam's rate limit) means a yellow "couldn't check every item" instead.
 - Phishing detection knows Steam and the main TF2 trading sites. A phishing site that imitates something else only gets the generic "unknown link" warning.
 - Avatar matching uses Steam's image hash. A slightly edited copy of an avatar gets a new hash, so the name checks are what catch it.
-- Trade Guard's panels never appear *inside* an offer's message. Text there that looks like a Trade Guard verdict was written by the other person.
+- Trade Guard's panels never appear *inside* an offer's message. Text there that looks like a Trade Guard verdict was written by the other person, and it won't show your secret phrase.
 - It relies on Steam's page structure and profile XML. If Steam changes them, the affected checks show a warning instead of a false "all clear".
 
 ## Development
