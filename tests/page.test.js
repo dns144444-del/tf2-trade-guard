@@ -128,8 +128,32 @@ test('a parsed offer message feeds the phishing checks', () => {
 
 // ----- trade window -----
 
-test('theirTradeAssetIds lists the partner side only, with null for other games', () => {
-    assert.deepEqual(Page.theirTradeAssetIds(load('trade-window.html')), ['9000000002', '9000000003', null]);
+test('theirTradeItems lists the partner side only, with each item\'s game and context', () => {
+    assert.deepEqual(Page.theirTradeItems(load('trade-window.html')), [
+        { appid: '440', contextid: '2', assetid: '9000000002' },
+        { appid: '440', contextid: '2', assetid: '9000000003' },
+        { appid: '730', contextid: '2', assetid: '9000000004' }
+    ]);
+});
+
+test('escrowDays reads the trade hold of each side', () => {
+    const scripts = [...load('trade-window.html').querySelectorAll('script')].map((s) => s.textContent).join('\n');
+
+    assert.deepEqual(Page.escrowDays(scripts), { mine: 0, theirs: 0 });
+    assert.deepEqual(Page.escrowDays('var g_daysMyEscrow = 0;\nvar g_daysTheirEscrow = 15;'), { mine: 0, theirs: 15 });
+    assert.equal(Page.escrowDays('var g_daysMyEscrow = 0;'), null); // half the answer is no answer
+});
+
+// ----- signing in through Steam -----
+
+test('route reads the site of a sign-in, signed in or at the password form', () => {
+    const query = '?openid.realm=https%3A%2F%2Fbackpack.tf%2F&openid.return_to=https%3A%2F%2Fbackpack.tf%2Flogin%2F';
+    const expected = { kind: 'login', realm: 'https://backpack.tf/', returnTo: 'https://backpack.tf/login/' };
+
+    assert.deepEqual(Page.route('/openid/login', query), expected);
+    // signed out, Steam moves the whole request into ?goto= (this shape is copied from a real redirect)
+    assert.deepEqual(Page.route('/openid/loginform/', `?goto=${encodeURIComponent(`/openid/login${query}`)}`), expected);
+    assert.deepEqual(Page.route('/openid/loginform/', '?goto=%%%'), { kind: 'login', realm: null, returnTo: null });
 });
 
 // ----- comments -----
@@ -142,6 +166,24 @@ test('commentParts takes the author name, not the avatar link that comes first',
     assert.equal(Core.impersonatesStaff(parts.author), true);
     assert.deepEqual(parts.hrefs, ['https://steamcommunity.com/linkfilter/?u=https%3A%2F%2Fsteamcommunlty.com%2Flogin']);
     assert.equal(Core.analyzeText(parts.text, parts.hrefs)[0].code, 'phishingLink');
+});
+
+test('commentParts knows who wrote each comment', () => {
+    const [phish, normal] = load('comments.html').querySelectorAll('.commentthread_comment');
+
+    assert.equal(Page.commentParts(phish).authorId, '76561198000000401');
+    assert.equal(Page.commentParts(normal).authorId, KIRO);
+});
+
+test('commentWall reads a public comment area and recognizes a hidden one', () => {
+    const wall = Page.commentWall(parseHTML(`<div class="commentthread_area">${fixture('comments.html')}</div>`).document);
+
+    assert.equal(wall.hidden, false);
+    assert.deepEqual(wall.comments.map((c) => c.authorId), ['76561198000000401', KIRO]);
+
+    // a private profile's /allcomments page has no comment area at all
+    const hidden = Page.commentWall(parseHTML('<div class="profile_private_info">This profile is private.</div>').document);
+    assert.deepEqual(hidden, { hidden: true, comments: [] });
 });
 
 test('commentParts leaves ordinary comments unflagged and skips deleted ones', () => {

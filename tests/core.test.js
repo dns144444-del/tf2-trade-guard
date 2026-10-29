@@ -590,3 +590,162 @@ test('impersonatesStaff catches names claiming to be Steam or Valve staff', () =
 test('assessPartner flags names claiming to be staff', () => {
     assert.deepEqual(codes(Core.assessPartner(profile({ name: 'Steam Support' }), [], { now: NOW })), ['staffImpersonation']);
 });
+
+// ----- trade holds and items from other games -----
+
+test('looksLikeBot recognizes the names trading sites give their bots', () => {
+    for (const name of ['STN Trading Bot #12', 'Scrap.TF Bot', 'B0T', 'mannco.store #3', 'Quicksell 7']) {
+        assert.equal(Core.looksLikeBot(name), true, name);
+    }
+    for (const name of ['Robotnik', 'Kiro', 'Abbot Hall', '']) {
+        assert.equal(Core.looksLikeBot(name), false, name);
+    }
+});
+
+test('escrowFindings flags a "bot" whose items would be held', () => {
+    assert.deepEqual(Core.escrowFindings({ mine: 0, theirs: 15 }, 'STN Trading Bot #3'),
+        [{ level: 'danger', code: 'botWithHold', value: 15 }]);
+    assert.deepEqual(Core.escrowFindings({ mine: 0, theirs: 15 }, 'Kiro'),
+        [{ level: 'warning', code: 'partnerHold', value: 15 }]);
+    assert.deepEqual(Core.escrowFindings({ mine: 0, theirs: 0 }, 'STN Trading Bot #3'), []);
+});
+
+test("escrowFindings stays quiet when the hold could come from the user's own side", () => {
+    assert.deepEqual(Core.escrowFindings({ mine: 15, theirs: 15 }, 'STN Trading Bot #3'), []);
+    assert.deepEqual(Core.escrowFindings(null, 'STN Trading Bot #3'), []);
+});
+
+test('otherGameFindings notes items from other games and flags ones posing as TF2 items', () => {
+    const key = 'Mann Co. Supply Crate Key';
+    const csKey = { appid: '730', description: { name: key, market_hash_name: key } };
+    const csSkin = { appid: '730', description: { name: 'AK-47 | Redline' } };
+    const card = { appid: '753', description: null };
+    const metal = { appid: '440', description: { name: 'Refined Metal' } };
+
+    assert.deepEqual(Core.otherGameFindings([metal]), []);
+    assert.deepEqual(Core.otherGameFindings([csSkin, card, metal]),
+        [{ level: 'info', code: 'otherGameItems', apps: ['Counter-Strike 2', 'Steam'], value: 2 }]);
+    assert.deepEqual(Core.otherGameFindings([csKey, metal]),
+        [{ level: 'danger', code: 'disguisedItem', apps: ['Counter-Strike 2'], names: [key] }]);
+    assert.equal(Core.otherGameFindings([{ appid: '999', description: { name: 'Thing' } }])[0].apps[0], 'app 999');
+});
+
+// ----- comment walls -----
+
+test('isScamReport reads warnings, not praise', () => {
+    for (const text of ['SCAMMER!! stole my unusual', '-rep scammed me', 'do not trade, impostor of my friend', 'Fake bot, api scam']) {
+        assert.equal(Core.isScamReport(text), true, text);
+    }
+    for (const text of ['+rep legit trader, not a scammer', '+rep fast trade', 'he is no thief', 'nice profile']) {
+        assert.equal(Core.isScamReport(text), false, text);
+    }
+    assert.equal(Core.isScamReport(`sc${cp(0x0430)}mmer`), true); // lookalike letters don't hide it
+});
+
+test('commentWallFindings weighs how many different people wrote a warning', () => {
+    const partner = '76561198000000999';
+    const wall = [
+        { authorId: '1', text: 'scammer' },
+        { authorId: '2', text: 'stole my hat' },
+        { authorId: partner, text: 'people call me a scammer lol' }, // the partner's own comment
+        { authorId: '2', text: 'scammer again' }
+    ];
+
+    const two = Core.commentWallFindings(wall, partner);
+    assert.deepEqual(two.map((f) => [f.level, f.code, f.value]), [['warning', 'scamReports', 2]]);
+    assert.deepEqual(two[0].excerpts, ['scammer', 'stole my hat']);
+
+    const three = Core.commentWallFindings(wall.concat({ authorId: '3', text: 'impostor' }), partner);
+    assert.equal(three[0].level, 'danger');
+    assert.deepEqual(Core.commentWallFindings([{ authorId: '1', text: '+rep' }], partner), []);
+});
+
+test('commentWallFindings flags hidden comments only on new accounts', () => {
+    assert.deepEqual(Core.commentWallFindings([], 'x', { hidden: true, ageDays: 20 }),
+        [{ level: 'warning', code: 'commentsHidden' }]);
+    assert.deepEqual(Core.commentWallFindings([], 'x', { hidden: true, ageDays: 2000 }), []);
+    assert.deepEqual(Core.commentWallFindings([], 'x', { hidden: true, ageDays: null }), []);
+});
+
+// ----- signing in through Steam -----
+
+test('loginCheck names the site and trusts known trading sites', () => {
+    assert.deepEqual(Core.loginCheck('https://backpack.tf/', 'https://backpack.tf/login/'),
+        { host: 'backpack.tf', level: 'ok', code: 'loginKnown' });
+    assert.deepEqual(Core.loginCheck('https://example.org/', 'https://example.org/auth'),
+        { host: 'example.org', level: 'warning', code: 'loginUnknown' });
+    assert.equal(Core.loginCheck('', ''), null);
+});
+
+test('loginCheck catches lookalike sites, mismatched return addresses and disguised hosts', () => {
+    assert.deepEqual(Core.loginCheck('https://backpack-tf.com/', 'https://backpack-tf.com/login'),
+        { host: 'backpack-tf.com', level: 'danger', code: 'loginLookalike', imitates: 'backpack.tf' });
+    assert.deepEqual(Core.loginCheck('https://backpack.tf/', 'https://evil.example/cb'),
+        { host: 'evil.example', level: 'danger', code: 'loginMismatch', realmHost: 'backpack.tf' });
+    assert.equal(Core.loginCheck('https://backpack.tf', 'https://backpack.tf@evil.example/').code, 'loginMismatch');
+
+    // malformed punycode that URL() rejects must not slip through
+    assert.equal(Core.loginCheck(null, 'https://xn--stamcommunity-r8i.com/x').code, 'loginLookalike');
+});
+
+// ----- verified bots and reports -----
+
+test('parseBotList reads pasted lists, profile links and exports', () => {
+    const pasted = [
+        'https://steamcommunity.com/profiles/76561198000000302/ STN Trading Bot #2',
+        '76561198000000303, Scrap.TF Bot',
+        'not an id',
+        '76561198000000302 duplicate',
+        '7656119800000030 too short'
+    ].join(String.fromCharCode(10));
+
+    assert.deepEqual(Core.parseBotList(pasted), [
+        { steamId: '76561198000000302', name: 'STN Trading Bot #2' },
+        { steamId: '76561198000000303', name: 'Scrap.TF Bot' }
+    ]);
+
+    const exported = JSON.stringify({ bots: [{ steamId: '76561198000000304', name: 'X' }, { steamId: 'bad' }] });
+    assert.deepEqual(Core.parseBotList(exported), [{ steamId: '76561198000000304', name: 'X' }]);
+    assert.deepEqual(Core.parseBotList(''), []);
+});
+
+const VERIFIED_BOT = { steamId: '76561198000000302', name: 'STN Trading Bot #2', avatarHash: null, source: 'verified' };
+
+test('assessPartner flags a copy of a verified bot even on first contact', () => {
+    const copy = Core.assessPartner(profile({ name: 'STN Trading Bot #2' }), [VERIFIED_BOT], { now: NOW });
+
+    assert.deepEqual(codes(copy), ['impostorVerifiedBot']);
+    assert.equal(Core.worstLevel(copy.findings), 'danger');
+});
+
+test('assessPartner trusts the verified bot itself and its numbered siblings', () => {
+    const contacts = [VERIFIED_BOT, { ...VERIFIED_BOT, steamId: '76561198000000303' }];
+    const real = Core.assessPartner(profile({ steamId: VERIFIED_BOT.steamId, name: 'STN Trading Bot #2' }), contacts, { now: NOW });
+    assert.deepEqual(codes(real), ['verifiedBot']);
+
+    const sibling = Core.assessPartner(profile({ name: 'STN Trading Bot #7' }), [VERIFIED_BOT], { now: NOW });
+    assert.deepEqual(codes(sibling), []);
+});
+
+test('reportText lays out who, whom and what for a report form', () => {
+    const text = Core.reportText({
+        scammer: { steamId: '76561199950000042', name: 'Kiro' },
+        impersonated: { steamId: '76561198000000301', name: 'Kiro' },
+        evidence: ['Impersonating your friend', 'New account'],
+        offerId: '7001',
+        when: NOW
+    });
+    const lines = text.split(String.fromCharCode(10));
+
+    assert.equal(lines[0], 'Scam attempt report');
+    assert.ok(lines.includes('Scammer: "Kiro" (SteamID64 76561199950000042) https://steamcommunity.com/profiles/76561199950000042'));
+    assert.ok(lines.includes('Impersonating: "Kiro" (SteamID64 76561198000000301) https://steamcommunity.com/profiles/76561198000000301'));
+    assert.ok(lines.includes('Trade offer: 7001'));
+    assert.ok(lines.includes('Date: 2026-10-29'));
+    assert.ok(lines.includes('- New account'));
+
+    const minimal = Core.reportText({
+        scammer: { steamId: '1', name: 'x' }, impersonated: null, evidence: [], when: NOW
+    });
+    assert.ok(!minimal.includes('Impersonating') && !minimal.includes('Trade offer'));
+});

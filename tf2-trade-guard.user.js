@@ -11,7 +11,11 @@
 // @match        https://steamcommunity.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_listValues
+// @grant        GM_deleteValue
 // @grant        GM_addStyle
+// @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
 // @run-at       document-end
 // @noframes
 // ==/UserScript==
@@ -450,7 +454,8 @@ const Core = (() => {
         return names.length ? { level: 'info', code: 'renamed', previousNames: names } : null;
     }
 
-    // contacts: [{ steamId, name, avatarHash, source: 'friend' | 'partner' }]
+    // contacts: [{ steamId, name, avatarHash, source: 'friend' | 'partner' | 'verified' }]
+    // ('verified': a trading bot the user added from the site's official list)
     // options: { selfId, now, aliases, anchors }
     // returns { findings: [{ level, code, ... }], ageDays, ageEstimated }
     function assessPartner(profile, contacts, options = {}) {
@@ -468,6 +473,10 @@ const Core = (() => {
         const trustedFriend = Boolean(friendEntry && !friendEntry.recentFriend);
         if (friendEntry && friendEntry.recentFriend) findings.push({ level: 'warning', code: 'recentFriend' });
 
+        // the real bot: other accounts copying it are the danger, so it isn't compared against anyone
+        const verifiedEntry = contacts.find((c) => c.source === 'verified' && c.steamId === profile.steamId);
+        if (verifiedEntry) findings.push({ level: 'info', code: 'verifiedBot' });
+
         const rename = renameFinding(profile, options.aliases, now);
 
         // trading sites sometimes run several bots with one name; a copy is usually new, private or just renamed
@@ -475,7 +484,7 @@ const Core = (() => {
 
         const formerNames = previousNames(profile, options.aliases);
 
-        for (const contact of contacts) {
+        for (const contact of verifiedEntry ? [] : contacts) {
             if (contact.steamId === profile.steamId || contact.steamId === options.selfId) continue;
 
             const nameMatch = compareNames(profile.name, contact.name);
@@ -491,7 +500,11 @@ const Core = (() => {
 
             if (impostor) {
                 // two real friends can share a common name; you already chose to friend this one
-                if (trustedFriend) {
+                if (contact.source === 'verified') {
+                    // the list is the user's own, so a copy is caught even on first contact; even a friend
+                    // suddenly named like a verified bot is more likely a stolen account than a coincidence
+                    findings.push({ level: 'danger', code: 'impostorVerifiedBot', contact, sameAvatar, sameName });
+                } else if (trustedFriend) {
                     findings.push({ level: 'warning', code: 'sharedIdentity', contact, sameAvatar, sameName });
                 } else if (contact.source === 'partner' && !friendEntry && established) {
                     findings.push({ level: 'warning', code: 'samePartnerName', contact, sameAvatar, sameName });
@@ -786,6 +799,174 @@ const Core = (() => {
         return STAFF_ORGS.some((org) => s.includes(org)) && STAFF_ROLES.some((role) => s.includes(role));
     }
 
+    // ----- trade holds and items from other games -----
+
+    const TRADING_BRANDS = ['stntrading', 'scraptf', 'mannco', 'marketplacetf', 'quicksell'].map(skeleton);
+
+    // the names trading sites give their bots: "STN Trading Bot #12", "Scrap.TF Bot", "B0T"
+    function looksLikeBot(name) {
+        return /(^|[^\p{L}])bots?([^\p{L}]|$)/u.test(lookalikeNormalize(name)) ||
+            TRADING_BRANDS.some((brand) => skeleton(name).includes(brand));
+    }
+
+    // escrow: { mine, theirs }, the days a trade would be held, from the trade window. A hold on their
+    // side means their account has no Steam Guard Mobile Authenticator, which every real trading bot
+    // has. It's only judged when your side has no hold, since otherwise the two can't be told apart.
+    function escrowFindings(escrow, partnerName) {
+        if (!escrow || escrow.mine !== 0 || !(escrow.theirs > 0)) return [];
+
+        return [looksLikeBot(partnerName)
+            ? { level: 'danger', code: 'botWithHold', value: escrow.theirs }
+            : { level: 'warning', code: 'partnerHold', value: escrow.theirs }];
+    }
+
+    const APP_NAMES = { 440: 'Team Fortress 2', 570: 'Dota 2', 730: 'Counter-Strike 2', 753: 'Steam', 252490: 'Rust' };
+
+    // words only TF2 items carry: on an item from another game they're a disguise
+    const TF2_ONLY_WORDS = [
+        'mann co', 'supply crate key', 'refined metal', 'reclaimed metal', 'scrap metal', 'australium',
+        'strangifier', 'killstreak kit', 'team captain', "bill's hat", 'earbuds'
+    ];
+
+    // items: [{ appid, description }] you'd receive. Trading across games is normal, but an item from
+    // another game named like a TF2 key or metal is a swap meant to pass for the real thing.
+    function otherGameFindings(items) {
+        const foreign = items.filter((item) => String(item.appid) !== '440');
+        if (!foreign.length) return [];
+
+        const apps = [...new Set(foreign.map((item) => APP_NAMES[item.appid] || `app ${item.appid}`))];
+        const disguised = foreign
+            .map((item) => item.description || {})
+            .filter((d) => {
+                const name = baseNormalize(`${d.name || ''} ${d.market_hash_name || ''}`);
+                return TF2_ONLY_WORDS.some((word) => hasWord(name, word));
+            });
+
+        return disguised.length
+            ? [{ level: 'danger', code: 'disguisedItem', apps, names: disguised.map((d) => d.name || d.market_hash_name) }]
+            : [{ level: 'info', code: 'otherGameItems', apps, value: foreign.length }];
+    }
+
+    // ----- the partner's comment wall -----
+
+    const SCAM_REPORT = new RegExp([
+        String.raw`\b(?:scam(?:mer|mers|med|ming)?|fraud|thief|stole|impost[eo]r|impersonat\w*|phish\w*)\b`,
+        String.raw`\b(?:api scam|fake (?:bot|account|middleman)|do ?n'?t trade|avoid (?:him|this|trading))\b`,
+        String.raw`(?:^|\s)-\s?rep\b`
+    ].join('|'));
+
+    // What other people write on a profile. "+rep, not a scammer" is praise, so positive comments and
+    // negated words don't count.
+    function isScamReport(text) {
+        const normalized = baseNormalize(text);
+        if (/\+\s?rep\b/.test(normalized) && !/(?:^|\s)-\s?rep\b/.test(normalized)) return false;
+
+        const withoutNegations = normalized.replace(/\b(?:not|no|never|isn'?t|wasn'?t|ain'?t)\s+(?:an?\s+)?\S+/g, ' ');
+        return SCAM_REPORT.test(withoutNegations);
+    }
+
+    // comments: [{ authorId, text }] from the partner's profile; options: { hidden, ageDays }
+    function commentWallFindings(comments, partnerId, options = {}) {
+        if (options.hidden) {
+            const young = typeof options.ageDays === 'number' && options.ageDays < 180;
+            return young ? [{ level: 'warning', code: 'commentsHidden' }] : [];
+        }
+
+        const reports = comments.filter((c) => c.authorId !== partnerId && isScamReport(c.text));
+        if (!reports.length) return [];
+
+        // friends joke about scamming each other; several different people saying it is what counts
+        const authors = new Set(reports.map((c) => c.authorId || c.text));
+
+        return [{
+            level: authors.size >= 3 ? 'danger' : 'warning',
+            code: 'scamReports',
+            value: authors.size,
+            excerpts: reports.slice(0, 2).map((c) => c.text.replace(/\s+/g, ' ').trim().slice(0, 80))
+        }];
+    }
+
+    // ----- signing in through Steam (OpenID) -----
+
+    // URL() rejects some malformed punycode a phishing link may still use, so fall back to reading the
+    // authority by hand rather than letting an odd domain pass unchecked
+    function hostOf(url) {
+        try {
+            return new URL(url).hostname.toLowerCase();
+        } catch {
+            const authority = (String(url || '').match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#\s]+)/i) || [])[1];
+            return authority ? authority.split('@').pop().split(':')[0].toLowerCase() : null;
+        }
+    }
+
+    // realm and return_to of a "Sign in through Steam" request: the site you'd sign in to, and how
+    // far to trust it
+    function loginCheck(realm, returnTo) {
+        const host = hostOf(returnTo) || hostOf(realm);
+        if (!host) return null;
+
+        const realmHost = hostOf(realm);
+        const imitates = imitatedSite(host);
+
+        if (realmHost && registrableDomain(realmHost) !== registrableDomain(host)) {
+            return { host, level: 'danger', code: 'loginMismatch', realmHost };
+        }
+        if (imitates) return { host, level: 'danger', code: 'loginLookalike', imitates };
+        if (imitates === '') return { host, level: 'ok', code: 'loginKnown' };
+
+        return { host, level: 'warning', code: 'loginUnknown' };
+    }
+
+    // ----- verified bots and scam reports -----
+
+    // what people paste: an exported list (JSON), profile links, or SteamID64s with a name after each
+    function parseBotList(text) {
+        const source = String(text || '').trim();
+        let entries;
+
+        try {
+            const data = JSON.parse(source);
+            const list = Array.isArray(data) ? data : (data && data.bots) || [];
+            entries = list.map((bot) => ({
+                steamId: String((bot && bot.steamId) || ''),
+                name: String((bot && bot.name) || '')
+            }));
+        } catch {
+            entries = source.split('\n').map((line) => {
+                const match = line.match(/7656119\d{10}/);
+                if (!match) return null;
+
+                const rest = line.slice(match.index + match[0].length).replace(/^[\s/,;:|-]+/, '');
+                return { steamId: match[0], name: rest };
+            }).filter(Boolean);
+        }
+
+        const seen = new Set();
+        return entries
+            .filter((bot) => /^7656119\d{10}$/.test(bot.steamId) && !seen.has(bot.steamId) && seen.add(bot.steamId))
+            .map((bot) => ({ steamId: bot.steamId, name: bot.name.trim().slice(0, 64) }));
+    }
+
+    // a ready-to-paste report: the scammer, who they copied, and what was detected
+    function reportText({ scammer, impersonated, evidence, offerId, when }) {
+        const profile = (steamId) => `https://steamcommunity.com/profiles/${steamId}`;
+
+        return [
+            'Scam attempt report',
+            `Scammer: "${scammer.name}" (SteamID64 ${scammer.steamId}) ${profile(scammer.steamId)}`,
+            impersonated
+                ? `Impersonating: "${impersonated.name}" (SteamID64 ${impersonated.steamId}) ${profile(impersonated.steamId)}`
+                : null,
+            offerId ? `Trade offer: ${offerId}` : null,
+            `Date: ${when.toISOString().slice(0, 10)}`,
+            '',
+            'What was detected:',
+            ...evidence.map((line) => `- ${line}`),
+            '',
+            'Detected with TF2 Trade Guard: https://github.com/dns144444-del/tf2-trade-guard'
+        ].filter((line) => line !== null).join('\n');
+    }
+
     function worstLevel(findings) {
         if (findings.some((f) => f.level === 'danger')) return 'danger';
         if (findings.some((f) => f.level === 'warning')) return 'warning';
@@ -820,6 +1001,14 @@ const Core = (() => {
         imitatedSite,
         analyzeText,
         impersonatesStaff,
+        looksLikeBot,
+        escrowFindings,
+        otherGameFindings,
+        isScamReport,
+        commentWallFindings,
+        loginCheck,
+        parseBotList,
+        reportText,
         worstLevel
     };
 })();
@@ -838,7 +1027,37 @@ const Page = (() => {
         const tradeWindow = pathname.match(/^\/tradeoffer\/(new|\d+)\/?$/);
         if (tradeWindow) return { kind: 'tradeWindow', offerId: tradeWindow[1] === 'new' ? null : tradeWindow[1] };
 
+        if (/^\/openid\/(?:login|loginform)\/?$/.test(pathname)) return { kind: 'login', ...openIdTarget(pathname, search) };
+
         return { kind: 'other' };
+    }
+
+    // "Sign in through Steam": /openid/login?openid.realm=...&openid.return_to=... when signed in, and
+    // /openid/loginform/?goto=<that same address> when Steam asks for the password first
+    function openIdTarget(pathname, search) {
+        let params = new URLSearchParams(search);
+
+        if (pathname.startsWith('/openid/loginform')) {
+            try {
+                params = new URL(params.get('goto') || '', 'https://steamcommunity.com').searchParams;
+            } catch {
+                params = new URLSearchParams();
+            }
+        }
+
+        return { realm: params.get('openid.realm'), returnTo: params.get('openid.return_to') };
+    }
+
+    // how many days the trade would be held for each side, from the trade window's inline scripts
+    function escrowDays(scriptsText) {
+        const days = (name) => {
+            const match = String(scriptsText).match(new RegExp(`\\b${name}\\s*=\\s*(-?\\d+)`));
+            return match ? Number(match[1]) : null;
+        };
+        const mine = days('g_daysMyEscrow');
+        const theirs = days('g_daysTheirEscrow');
+
+        return mine === null || theirs === null ? null : { mine, theirs };
     }
 
     // forum threads use the same comment markup, but advice like "contact Steam Support" is normal there
@@ -914,10 +1133,13 @@ const Page = (() => {
         });
     }
 
-    // the trade window shows items as #item<app>_<context>_<assetid>; null for anything that isn't a
-    // TF2 item, so the caller can say it couldn't check it
-    function theirTradeAssetIds(root) {
-        return [...root.querySelectorAll('#their_slots .item')].map((el) => (el.id.match(/^item440_2_(\d+)$/) || [])[1] || null);
+    // the trade window shows items as #item<app>_<context>_<assetid>; null for one it can't read, so
+    // the caller can say it couldn't check it
+    function theirTradeItems(root) {
+        return [...root.querySelectorAll('#their_slots .item')].map((el) => {
+            const match = el.id.match(/^item(\d+)_(\d+)_(\d+)$/);
+            return match ? { appid: match[1], contextid: match[2], assetid: match[3] } : null;
+        });
     }
 
     // a comment on a profile, group or workshop page
@@ -930,12 +1152,27 @@ const Page = (() => {
         const author = comment.querySelector('.commentthread_author_link') ||
             [...comment.querySelectorAll('.commentthread_comment_author a')].find((a) => a.textContent.trim());
 
+        const authorAccount = author && author.getAttribute('data-miniprofile');
+
         return {
             textEl: text,
             text: text.textContent,
             hrefs: [...text.querySelectorAll('a[href]')].map((a) => a.getAttribute('href')),
-            author: author ? author.textContent.trim() : ''
+            author: author ? author.textContent.trim() : '',
+            authorId: /^\d+$/.test(authorAccount || '') ? Core.accountIdToSteamId64(authorAccount) : null
         };
+    }
+
+    // a profile's /allcomments page; a private profile has no comment area at all
+    function commentWall(root) {
+        if (!root.querySelector('.commentthread_area')) return { hidden: true, comments: [] };
+
+        const comments = [...root.querySelectorAll('.commentthread_comment')]
+            .map(commentParts)
+            .filter(Boolean)
+            .map(({ authorId, text }) => ({ authorId, text }));
+
+        return { hidden: false, comments };
     }
 
     return {
@@ -943,12 +1180,14 @@ const Page = (() => {
         wantsCommentCheck,
         selfSteamId,
         tradePartnerId,
+        escrowDays,
         friendName,
         parseFriends,
         findPartner,
         parseOfferList,
-        theirTradeAssetIds,
-        commentParts
+        theirTradeItems,
+        commentParts,
+        commentWall
     };
 })();
 
@@ -991,6 +1230,7 @@ function runUserscript() {
         profileError: "Couldn't load this account's profile.",
         steamId: 'SteamID64',
         age: (d, estimated) => `${estimated ? '~' : ''}${d >= 365 ? `${Math.floor(d / 365)} year(s)` : `${d} day(s)`} old account${estimated ? ' (estimated from SteamID)' : ''}`,
+        ageShort: (d, estimated) => `${estimated ? 'about ' : ''}${d >= 365 ? `${Math.floor(d / 365)} year(s)` : `${d} day(s)`} old`,
         what: (f) => (f.sameAvatar && f.sameName ? 'name and avatar' : f.sameAvatar ? 'avatar' : 'name'),
         impostorFriend: (f, what) => `Impersonating your friend "${f.contact.name}": same ${what}, but a DIFFERENT account (the real one is ${f.contact.steamId}).`,
         impostorPartner: (f, what) => `Another account with the same ${what} has traded with you before (${f.contact.steamId}, "${f.contact.name}"). One of them is an impostor.`,
@@ -1034,7 +1274,66 @@ function runUserscript() {
         revoke: 'Revoke now',
         trust: "It's mine, trust this key",
         trustPrompt: (expected) => `NO legitimate site or person will ever ask you to press this button.\n\nOnly continue if YOU created this key (e.g. for your own bot). If unsure, cancel and revoke it.\n\nTo confirm, type exactly: ${expected}`,
-        trustMismatch: "That doesn't match. The key was NOT marked as trusted."
+        trustMismatch: "That doesn't match. The key was NOT marked as trusted.",
+
+        // verified bots, trade holds, other games, comment walls
+        verifiedBot: 'On your verified bots list.',
+        impostorVerifiedBot: (f, what) => `Impersonating the verified bot "${f.contact.name}" (${f.contact.steamId}): same ${what}, but a DIFFERENT account. Do NOT trade.`,
+        botWithHold: (f) => `Calls itself a bot, but this trade would be held ${f.value} day(s): its owner has no Steam Guard Mobile Authenticator. Every real trading bot has one, so this is almost certainly an impostor.`,
+        partnerHold: (f) => `Their items would be held ${f.value} day(s): this account has no Steam Guard Mobile Authenticator.`,
+        otherGameItems: (f) => `${f.value} item(s) you receive are from another game (${f.apps.join(', ')}). Make sure that's what you agreed to.`,
+        disguisedItem: (f) => `${quoteList(f.names)} is from another game (${f.apps.join(', ')}), named like a TF2 item. It's NOT the TF2 item it pretends to be.`,
+        scamReports: (f) => `${f.value} other user(s) wrote scam warnings on this profile, e.g. ${quoteList(f.excerpts)}.`,
+        commentsHidden: 'New account with its profile comments hidden, so nobody can leave warnings on it.',
+        commentsUnchecked: "Couldn't read this profile's comments.",
+        confirmReminder: (name, age) => `Before confirming in the Steam app or email: the confirmation must show "${name}"${age ? ` and an account that's ${age}` : ''}. If anything differs, cancel it.`,
+
+        // reporting
+        reportLabel: 'Report this account:',
+        reportCopy: 'Copy report',
+        reportCopied: 'Report copied',
+        reportSteam: 'Steam',
+        reportBptf: 'backpack.tf',
+        reportHint: 'Each button copies the report, ready to paste.',
+        reportGuide: 'Trade Guard copied a report for this account. To report it on Steam: open the "…" menu next to the profile buttons, choose "Report Player", then "Attempted Trade Scam" (or impersonation), and paste the report.',
+        reportGuideClose: 'Done',
+
+        // signing in through Steam
+        loginHead: (host) => `You're signing in to ${host} with your Steam account.`,
+        loginKnown: 'A well-known trading site.',
+        loginUnknown: "Trade Guard doesn't know this site. Only continue if you opened it yourself.",
+        loginLookalike: (f) => `FAKE SITE: this imitates ${f.imitates}. Close this page and do NOT sign in.`,
+        loginMismatch: (f) => `FAKE SIGN-IN: it claims to be ${f.realmHost} but sends you back to a different site. Close this page.`,
+        loginTip: 'Steam only tells this site your SteamID. Only type your password on steamcommunity.com, and only when this bar shows your secret phrase.',
+        loginNoPhrase: 'Tip: set a secret phrase in the Tampermonkey menu, so you can tell this bar from a fake one.',
+
+        // menu and dialogs
+        menuCheckup: 'Security checkup',
+        menuPhrase: 'Set secret phrase',
+        menuBots: 'Verified bots',
+        menuUpdates: 'Check for updates',
+        phrasePrompt: 'Choose a secret phrase (up to 40 characters). Trade Guard shows it on every warning and on the Steam sign-in page, so a fake panel or a fake login window can\'t pass for the real one.\n\nLeave it empty to remove it.',
+        phraseSaved: 'Secret phrase saved.',
+        close: 'Close',
+        botsTitle: 'Verified bots',
+        botsHelp: 'Paste SteamID64s or profile links from a trading site\'s OFFICIAL bot list (one per line, a name after each), or a list exported from Trade Guard. Accounts copying these bots are flagged red, even on first contact.',
+        botsAdd: 'Add',
+        botsAdded: (n) => `${n} bot(s) added.`,
+        botsNone: 'No verified bots yet.',
+        botsRemove: 'Remove',
+        botsExport: 'Copy list as JSON',
+        checkupTitle: 'Security checkup',
+        checkupApiKey: (s) => (!s ? "API key: not checked yet." : s.state === 'key'
+            ? `API key: a key IS registered${s.domain ? ` (domain: ${s.domain})` : ''}. Revoke it unless you made it.`
+            : 'API key: none registered. Good.'),
+        checkupApiNow: 'Check now',
+        checkupPhrase: (set) => (set ? 'Secret phrase: set.' : 'Secret phrase: not set. It helps you tell real warnings from fakes.'),
+        checkupBots: (n) => `Verified bots: ${n}.`,
+        checkupData: (d) => `Stored on this browser: ${d.friends} friend(s), ${d.partners} past partner(s), ${d.profiles} cached profile(s).`,
+        checkupForget: 'Forget everything',
+        forgetConfirm: 'Delete everything Trade Guard has stored in this browser (friends, partners, caches, trusted keys, verified bots and your secret phrase)?',
+        forgotten: 'Everything was deleted.',
+        checkupSecurity: 'Report a vulnerability'
     };
 
     // Data about the logged-in account is kept per account, so switching to an alt on the same
@@ -1048,9 +1347,10 @@ function runUserscript() {
     const store = {
         get: (key, fallback) => {
             const value = GM_getValue(scopedKey(key), fallback);
-            if (typeof value !== 'string') return value;
 
-            // 0.1.0 stored JSON strings
+            // 0.1.0 stored objects as JSON strings; plain text values (the secret phrase) are kept as they are
+            if (typeof value !== 'string' || !/^[[{]/.test(value)) return value;
+
             try {
                 return JSON.parse(value);
             } catch {
@@ -1099,23 +1399,40 @@ function runUserscript() {
         return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
     }
 
+    const SHIELD = String.fromCodePoint(0x1F6E1, 0xFE0F);
+
+    // "Trade Guard" plus the user's secret phrase, on everything Trade Guard draws. A fake panel
+    // written into an offer message, or a fake login window on a phishing site, can't know the phrase.
+    function brand() {
+        const phrase = store.get('secretPhrase', '');
+        return [
+            h('strong', { text: `${SHIELD} Trade Guard` }),
+            phrase ? h('span', { class: 'tg-phrase', text: phrase }) : null
+        ];
+    }
+
+    function openTab(url) {
+        window.open(url, '_blank', 'noopener,noreferrer');
+    }
+
     // ----- API key watch -----
 
     // the cached banner is already on the page, and its text must never be parsed as Steam's
     function pageHtmlWithoutOwnUi() {
         const copy = document.documentElement.cloneNode(true);
-        copy.querySelectorAll('#tg-api-banner, .tg-panel').forEach((node) => node.remove());
+        copy.querySelectorAll('#tg-api-banner, #tg-report-guide, #tg-dialog, .tg-panel').forEach((node) => node.remove());
 
         return copy.outerHTML;
     }
 
-    async function checkApiKey(force) {
+    // force: trade pages check more often; fresh: skip the cache entirely (the checkup's "Check now")
+    async function checkApiKey(force, fresh = false) {
         const previous = store.get('apikey', null);
         const maxAge = force ? 2 * MINUTE : 15 * MINUTE;
         const onKeyPage = location.pathname.startsWith('/dev/apikey');
 
         // on the key page itself the answer is already on screen, so never trust the cache
-        if (!onKeyPage && previous && Date.now() - previous.checkedAt < maxAge) return previous;
+        if (!fresh && !onKeyPage && previous && Date.now() - previous.checkedAt < maxAge) return previous;
 
         const page = onKeyPage
             ? { text: pageHtmlWithoutOwnUi(), url: location.href }
@@ -1145,7 +1462,7 @@ function runUserscript() {
 
         if (afterCheck && (!status || Date.now() - status.checkedAt > DAY)) {
             document.body.prepend(h('div', { id: 'tg-api-banner', class: 'tg-unverified' },
-                h('span', { text: T.apiUnverified }),
+                h('span', { class: 'tg-banner-text' }, ...brand(), ' ', T.apiUnverified),
                 h('a', { class: 'tg-btn', href: 'https://steamcommunity.com/dev/apikey', text: T.openKeyPage })
             ));
             return;
@@ -1187,7 +1504,8 @@ function runUserscript() {
         const canTrust = Boolean(status.keyTail);
 
         document.body.prepend(h('div', { id: 'tg-api-banner' },
-            h('span', { text: T.apiBanner(status) + (canTrust ? '' : ` ${T.apiKeyUnreadable}`) }),
+            h('span', { class: 'tg-banner-text' },
+                ...brand(), ' ', T.apiBanner(status) + (canTrust ? '' : ` ${T.apiKeyUnreadable}`)),
             revoke,
             canTrust ? trust : null
         ));
@@ -1230,7 +1548,11 @@ function runUserscript() {
             .filter(([steamId]) => !friendIds.has(steamId))
             .map(([steamId, p]) => ({ steamId, name: p.name, avatarHash: p.avatarHash, source: 'partner' }));
 
-        return { contacts: markRecentFriends(friends).concat(partners), friendsStatus };
+        // bots the user verified from a site's official list; kept for every account on this browser
+        const verified = store.get('verifiedBots', [])
+            .map((bot) => ({ steamId: bot.steamId, name: bot.name, avatarHash: null, source: 'verified' }));
+
+        return { contacts: markRecentFriends(friends).concat(partners, verified), friendsStatus };
     }
 
     // Remembers when each friend first appeared. The first list ever seen is the baseline, so only
@@ -1339,6 +1661,33 @@ function runUserscript() {
         return aliases;
     }
 
+    // The partner's comment wall, reduced to what matters: whether it's hidden, and the scam warnings
+    // other people left on it. Other comments aren't kept.
+    async function getCommentWall(steamId) {
+        const cache = store.get('commentWalls', {});
+        const hit = cache[steamId];
+
+        if (hit && Date.now() - hit.fetchedAt < 6 * HOUR) return hit.wall;
+
+        const { text } = await getText(`/profiles/${steamId}/allcomments?l=english`);
+        const parsed = Page.commentWall(new DOMParser().parseFromString(text, 'text/html'));
+        const wall = {
+            hidden: parsed.hidden,
+            comments: parsed.comments
+                .filter((comment) => Core.isScamReport(comment.text))
+                .slice(0, 10)
+                .map((comment) => ({
+                    authorId: comment.authorId,
+                    text: comment.text.replace(/\s+/g, ' ').trim().slice(0, 200)
+                }))
+        };
+
+        cache[steamId] = { wall, fetchedAt: Date.now() };
+        store.set('commentWalls', keepNewest(cache, MAX_PROFILES_CACHED));
+
+        return wall;
+    }
+
     // ----- copied-offer detection -----
 
     // History still lists offers that were canceled seconds after arriving, which the user may
@@ -1415,51 +1764,64 @@ function runUserscript() {
         return itemDescriptions.get(key);
     }
 
+    // described: [{ appid, description }]; the Name and Description Tag checks plus the other-game check
+    function describedItemFindings(described) {
+        const descriptions = described.map((item) => item.description).filter(Boolean);
+        return [...Core.itemFindings(descriptions), ...Core.otherGameFindings(described.filter((item) => item.appid))];
+    }
+
     // keys: data-economy-item values of the items you'd receive
     async function receivedItemFindings(keys) {
         const unique = [...new Set(keys)];
-        const descriptions = [];
+        const described = [];
         let incomplete = unique.length > MAX_ITEMS_CHECKED;
 
         for (const key of unique.slice(0, MAX_ITEMS_CHECKED)) {
+            const appid = (String(key).match(/^classinfo\/(\d+)\//) || [])[1] || null;
+
             // spaced out so a long offer list doesn't hit Steam's rate limit
             if (!itemDescriptions.has(key)) await sleep(100);
 
+            let description = null;
             try {
-                const description = await getItemDescription(key);
-                if (description) descriptions.push(description);
-                else incomplete = true;
+                description = await getItemDescription(key);
             } catch (error) {
                 log('item lookup failed', key, error);
-                incomplete = true;
             }
+
+            if (!description) incomplete = true;
+            described.push({ appid, description });
         }
 
-        const findings = Core.itemFindings(descriptions);
+        const findings = describedItemFindings(described);
         if (incomplete) findings.push({ level: 'warning', code: 'itemsUnchecked' });
         return findings;
     }
 
-    // The trade window shows items as #item<app>_<context>_<assetid> without their descriptions,
-    // so the partner's public inventory is read once to look them up.
-    let partnerInventoryLoad = null;
+    // The trade window shows items as #item<app>_<context>_<assetid> without their descriptions, so
+    // the partner's public inventory for each game is read once to look them up.
+    const partnerInventories = new Map(); // `${appid}_${contextid}` → Promise<Map<assetid, description>>
 
-    function getPartnerInventory(partnerId) {
-        if (!partnerInventoryLoad) {
-            partnerInventoryLoad = loadPartnerInventory(partnerId).catch((error) => {
-                partnerInventoryLoad = null; // try again on the next change
+    function getPartnerInventory(partnerId, appid, contextid) {
+        const key = `${appid}_${contextid}`;
+
+        if (!partnerInventories.has(key)) {
+            partnerInventories.set(key, loadPartnerInventory(partnerId, appid, contextid).catch((error) => {
+                partnerInventories.delete(key); // try again on the next change
                 throw error;
-            });
+            }));
         }
-        return partnerInventoryLoad;
+
+        return partnerInventories.get(key);
     }
 
-    async function loadPartnerInventory(partnerId) {
+    async function loadPartnerInventory(partnerId, appid, contextid) {
         const byAsset = new Map();
         let start = '';
 
         for (let page = 0; page < 5; page++) {
-            const { text } = await getText(`/inventory/${partnerId}/440/2?l=english&count=2000${start ? `&start_assetid=${start}` : ''}`);
+            const path = `/inventory/${partnerId}/${appid}/${contextid}?l=english&count=2000`;
+            const { text } = await getText(start ? `${path}&start_assetid=${start}` : path);
             const data = JSON.parse(text);
             if (!data || !data.success) throw new Error('inventory unavailable');
 
@@ -1475,20 +1837,33 @@ function runUserscript() {
     }
 
     async function tradeWindowItemFindings(partnerId) {
-        const ids = Page.theirTradeAssetIds(document);
-        if (!ids.length) return [];
+        const items = Page.theirTradeItems(document);
+        if (!items.length) return [];
 
-        try {
-            const inventory = await getPartnerInventory(partnerId);
-            const descriptions = ids.map((id) => id && inventory.get(id));
-            const findings = Core.itemFindings(descriptions.filter(Boolean));
+        const described = [];
+        let incomplete = false;
 
-            if (descriptions.some((d) => !d)) findings.push({ level: 'warning', code: 'itemsUnchecked' });
-            return findings;
-        } catch (error) {
-            log('partner inventory unavailable', error);
-            return [{ level: 'warning', code: 'itemsUnchecked' }];
+        for (const item of items) {
+            if (!item) {
+                incomplete = true;
+                continue;
+            }
+
+            let description = null;
+            try {
+                const inventory = await getPartnerInventory(partnerId, item.appid, item.contextid);
+                description = inventory.get(item.assetid) || null;
+            } catch (error) {
+                log('partner inventory unavailable', item.appid, error);
+            }
+
+            if (!description) incomplete = true;
+            described.push({ appid: item.appid, description });
         }
+
+        const findings = describedItemFindings(described);
+        if (incomplete) findings.push({ level: 'warning', code: 'itemsUnchecked' });
+        return findings;
     }
 
     // ----- trade offer panels -----
@@ -1509,7 +1884,7 @@ function runUserscript() {
     function renderNotice(panel, code) {
         setPanelLevel(panel, 'warning');
         panel.replaceChildren(
-            h('div', { class: 'tg-head' }, h('strong', { text: '🛡\uFE0F Trade Guard · ' }), T.verdict.warning),
+            h('div', { class: 'tg-head' }, ...brand(), ' · ', T.verdict.warning),
             h('ul', {}, h('li', { class: 'tg-warning', text: T[code] }))
         );
     }
@@ -1526,14 +1901,50 @@ function runUserscript() {
             .map((finding) => h('li', { class: `tg-${finding.level}`, text: findingText(finding) }));
     }
 
-    function renderPanel(panel, profile, findings, ageDays, ageEstimated) {
+    // Every button copies a ready-to-paste report first. Steam's form and backpack.tf's issue tracker
+    // open in a new tab, where the user pastes and sends it themselves: Trade Guard sends nothing.
+    function reportRow(profile, findings, context) {
+        const impersonation = findings.find((f) => f.contact && /^impostor/.test(f.code));
+        const text = Core.reportText({
+            scammer: { steamId: profile.steamId, name: profile.name },
+            impersonated: impersonation ? impersonation.contact : null,
+            evidence: sortBySeverity(findings).filter((f) => f.level !== 'info').map(findingText),
+            offerId: context.offerId || null,
+            when: new Date()
+        });
+
+        const copy = () => GM_setClipboard(text, 'text');
+        const button = (label, onclick) => h('button', { class: 'tg-btn tg-btn-small', type: 'button', text: label, onclick });
+        const copyButton = button(T.reportCopy, () => {
+            copy();
+            copyButton.textContent = T.reportCopied;
+        });
+
+        return h('div', { class: 'tg-report' },
+            h('span', { text: T.reportLabel }),
+            copyButton,
+            button(T.reportSteam, () => {
+                copy();
+                openTab(`https://steamcommunity.com/profiles/${profile.steamId}/#tradeguard-report`);
+            }),
+            button(T.reportBptf, () => {
+                copy();
+                openTab('https://backpack.tf/issues');
+            }),
+            h('span', { class: 'tg-report-hint', text: T.reportHint })
+        );
+    }
+
+    // context: { offerId } of the offer the panel belongs to, for the report
+    function renderPanel(panel, profile, findings, ageDays, ageEstimated, context = {}) {
         const level = Core.worstLevel(findings);
         const id = profile.steamId;
 
         setPanelLevel(panel, level);
         panel.dataset.level = level;
-        panel.replaceChildren(
-            h('div', { class: 'tg-head' }, h('strong', { text: '🛡\uFE0F Trade Guard · ' }), h('span', { class: 'tg-verdict', text: T.verdict[level] })),
+        // replaceChildren would print a null as the text "null", unlike h()
+        panel.replaceChildren(...[
+            h('div', { class: 'tg-head' }, ...brand(), ' · ', h('span', { class: 'tg-verdict', text: T.verdict[level] })),
             // the real SteamID64 comes first and the name is quoted, so a name that imitates
             // this line ("Kiro · SteamID64: 7656...") can't pass for it
             h('div', { class: 'tg-info' },
@@ -1547,10 +1958,9 @@ function runUserscript() {
                 ' · ',
                 h('a', { href: `https://backpack.tf/profiles/${id}`, target: '_blank', rel: 'noopener noreferrer', text: 'backpack.tf' })
             ),
-            findings.length
-                ? h('ul', {}, findingItems(findings, 6))
-                : null
-        );
+            findings.length ? h('ul', {}, findingItems(findings, 6)) : null,
+            level === 'danger' ? reportRow(profile, findings, context) : null
+        ].filter(Boolean));
     }
 
     function profileFallback(steamId, avatarSrc) {
@@ -1565,7 +1975,9 @@ function runUserscript() {
         };
     }
 
-    async function assessAndRender(panel, steamId, avatarSrc, contacts, selfId, extraFindings = []) {
+    // context: { offerId, lateFindings(profile) } for checks that need the partner's profile first
+    // returns { profile, ageDays, ageEstimated }
+    async function assessAndRender(panel, steamId, avatarSrc, contacts, selfId, extraFindings = [], context = {}) {
         let profile = null;
 
         try {
@@ -1590,11 +2002,23 @@ function runUserscript() {
 
         if (!profile) findings.push({ level: 'warning', code: 'profileError' });
 
-        renderPanel(panel, usable, findings.concat(extraFindings), ageDays, ageEstimated);
+        // what other people wrote on the partner's profile; an extra signal, so failing isn't a warning
+        if (profile) {
+            try {
+                const wall = await getCommentWall(steamId);
+                findings.push(...Core.commentWallFindings(wall.comments, steamId, { hidden: wall.hidden, ageDays }));
+            } catch (error) {
+                log('comment wall unavailable', steamId, error);
+                findings.push({ level: 'info', code: 'commentsUnchecked' });
+            }
+        }
+
+        const late = context.lateFindings ? context.lateFindings(usable) : [];
+        renderPanel(panel, usable, findings.concat(extraFindings, late), ageDays, ageEstimated, context);
 
         if (profile) rememberPartner(profile);
 
-        return usable;
+        return { profile: usable, ageDays, ageEstimated };
     }
 
     // ----- trade offer list -----
@@ -1631,8 +2055,8 @@ function runUserscript() {
                 // your own message isn't evidence of anything
                 if (!isSent) extra.push(...Core.analyzeText(offer.message, offer.messageLinks, { unknownLinks: true }));
 
-                const profile = await assessAndRender(
-                    panel, offer.partnerId, offer.partnerAvatar, contacts, selfId, extra
+                const { profile } = await assessAndRender(
+                    panel, offer.partnerId, offer.partnerAvatar, contacts, selfId, extra, { offerId: offer.offerId }
                 );
 
                 // later offers in this same list are compared against this partner too
@@ -1693,6 +2117,8 @@ function runUserscript() {
             return;
         }
 
+        let partner;
+
         try {
             const { contacts, friendsStatus } = await buildContacts();
             const extra = friendsFindings(friendsStatus);
@@ -1700,17 +2126,26 @@ function runUserscript() {
             // a received offer opened directly (e.g. from a notification) gets the same checks as the list
             if (offerId) extra.push(...await receivedOfferFindings(selfId, offerId));
 
-            await assessAndRender(panel, partnerId, null, contacts, selfId, extra);
+            const escrow = Page.escrowDays(pageScriptsText());
+            partner = await assessAndRender(panel, partnerId, null, contacts, selfId, extra, {
+                offerId,
+                lateFindings: (profile) => Core.escrowFindings(escrow, profile.name)
+            });
         } catch (error) {
             log('trade window check failed', error);
             renderNotice(panel, 'checkFailed');
             return;
         }
 
+        // the last step happens in the Steam app or an email, where only the name and account age show
+        const { profile, ageDays, ageEstimated } = partner;
+        const age = ageDays !== null ? T.ageShort(ageDays, ageEstimated) : null;
+        const reminder = h('div', { class: 'tg-confirm', text: T.confirmReminder(profile.name || profile.steamId, age) });
+
         // item counts change while the offer is being built, so keep them live
         const counter = h('div', { class: 'tg-counts' });
         const liveItems = h('ul', { class: 'tg-live' });
-        panel.append(counter, liveItems);
+        panel.append(counter, liveItems, reminder);
 
         const rank = { ok: 0, warning: 1, danger: 2 };
         let giftLevel = 'ok';
@@ -1798,7 +2233,8 @@ function runUserscript() {
 
         const level = Core.worstLevel(findings);
         parts.textEl.after(h('div', { class: `tg-comment tg-${level}` },
-            h('strong', { text: 'Trade Guard: ' }),
+            ...brand(),
+            ': ',
             sortBySeverity(findings).map(findingText).join(' ')
         ));
     }
@@ -1834,15 +2270,231 @@ function runUserscript() {
         areas.forEach((area) => observer.observe(area, { childList: true, subtree: true }));
     }
 
+    // ----- signing in through Steam -----
+
+    // Says which site a "Sign in through Steam" request is for. It runs signed out too: the password
+    // form is exactly where a phishing page would want you.
+    function guardLogin({ realm, returnTo }) {
+        const check = Core.loginCheck(realm, returnTo);
+        if (!check) return;
+
+        const phraseSet = Boolean(store.get('secretPhrase', ''));
+
+        document.body.prepend(h('div', { id: 'tg-login-banner', class: `tg-${check.level}` },
+            h('div', { class: 'tg-head' }, ...brand()),
+            h('div', { class: 'tg-login-host', text: T.loginHead(check.host) }),
+            h('div', { class: 'tg-login-verdict', text: findingText(check) }),
+            h('div', { class: 'tg-login-tip', text: T.loginTip }),
+            phraseSet ? null : h('div', { class: 'tg-login-tip', text: T.loginNoPhrase })
+        ));
+    }
+
+    // ----- reporting on Steam -----
+
+    // the profile opened by a panel's "Steam" report button: Steam has no direct link to its report
+    // form, so this explains the three clicks to get there
+    function showReportGuide() {
+        const guide = h('div', { id: 'tg-report-guide' },
+            h('span', { class: 'tg-banner-text' }, ...brand(), ' ', T.reportGuide),
+            h('button', {
+                class: 'tg-btn',
+                type: 'button',
+                text: T.reportGuideClose,
+                onclick: () => {
+                    guide.remove();
+                    history.replaceState(null, '', location.pathname + location.search);
+                }
+            })
+        );
+
+        document.body.prepend(guide);
+    }
+
+    // ----- menu: secret phrase, verified bots, security checkup -----
+
+    const REPO_URL = 'https://github.com/dns144444-del/tf2-trade-guard';
+
+    function closeDialog() {
+        document.getElementById('tg-dialog')?.remove();
+    }
+
+    function showDialog(title, ...content) {
+        closeDialog();
+
+        const dialog = h('div', {
+            id: 'tg-dialog',
+            onclick: (event) => {
+                if (event.target === dialog) closeDialog();
+            }
+        }, h('div', { class: 'tg-dialog-box', role: 'dialog' },
+            h('div', { class: 'tg-head' }, ...brand(), ` · ${title}`),
+            ...content,
+            h('div', { class: 'tg-dialog-actions' }, h('button', { class: 'tg-btn', type: 'button', text: T.close, onclick: closeDialog }))
+        ));
+
+        document.body.append(dialog);
+    }
+
+    function setSecretPhrase() {
+        const value = prompt(T.phrasePrompt, store.get('secretPhrase', ''));
+        if (value === null) return;
+
+        // invisible and control characters would make two different phrases look the same
+        const phrase = value.replace(/\p{C}/gu, '').replace(/\s+/g, ' ').trim().slice(0, 40);
+        store.set('secretPhrase', phrase);
+
+        // panels already on the page show the new phrase right away
+        document.querySelectorAll('.tg-phrase').forEach((node) => { node.textContent = phrase; });
+        alert(T.phraseSaved);
+    }
+
+    function showVerifiedBots() {
+        const list = h('ul', { class: 'tg-bot-list' });
+        const input = h('textarea', { class: 'tg-textarea', rows: '5', placeholder: '76561198... STN Trading Bot #1' });
+        const status = h('div', { class: 'tg-dialog-status' });
+
+        const render = () => {
+            const bots = store.get('verifiedBots', []);
+
+            list.replaceChildren(...(bots.length ? bots.map((bot) => h('li', {},
+                h('code', { text: bot.steamId }),
+                bot.name ? ` "${bot.name}" ` : ' ',
+                h('button', {
+                    class: 'tg-btn tg-btn-small',
+                    type: 'button',
+                    text: T.botsRemove,
+                    onclick: () => {
+                        store.set('verifiedBots', store.get('verifiedBots', []).filter((b) => b.steamId !== bot.steamId));
+                        render();
+                    }
+                })
+            )) : [h('li', { text: T.botsNone })]));
+        };
+
+        const add = () => {
+            const existing = store.get('verifiedBots', []);
+            const known = new Set(existing.map((bot) => bot.steamId));
+            const added = Core.parseBotList(input.value)
+                .filter((bot) => !known.has(bot.steamId))
+                .map((bot) => ({ ...bot, addedAt: Date.now() }));
+
+            store.set('verifiedBots', existing.concat(added));
+            status.textContent = T.botsAdded(added.length);
+            input.value = '';
+            render();
+        };
+
+        const exportList = () => {
+            const bots = store.get('verifiedBots', []).map(({ steamId, name }) => ({ steamId, name }));
+            GM_setClipboard(JSON.stringify({ bots }, null, 2), 'text');
+        };
+
+        render();
+        showDialog(T.botsTitle,
+            h('p', { text: T.botsHelp }),
+            input,
+            h('div', { class: 'tg-dialog-actions' },
+                h('button', { class: 'tg-btn', type: 'button', text: T.botsAdd, onclick: add }),
+                h('button', { class: 'tg-btn', type: 'button', text: T.botsExport, onclick: exportList })
+            ),
+            status,
+            list
+        );
+    }
+
+    function showCheckup() {
+        const apiLine = h('li', { text: T.checkupApiKey(store.get('apikey', null)) });
+        const checkNow = h('button', {
+            class: 'tg-btn tg-btn-small',
+            type: 'button',
+            text: T.checkupApiNow,
+            onclick: async () => {
+                try {
+                    const status = await checkApiKey(true, true);
+                    apiLine.textContent = T.checkupApiKey(status);
+                    showApiBanner(status, true);
+                } catch (error) {
+                    log('API key check failed', error);
+                }
+            }
+        });
+        apiLine.append(' ', checkNow);
+
+        const friends = store.get('friends', null);
+        const data = {
+            friends: friends && Array.isArray(friends.list) ? friends.list.length : 0,
+            partners: Object.keys(store.get('partners', {})).length,
+            profiles: Object.keys(store.get('profiles', {})).length
+        };
+
+        const forget = () => {
+            if (!confirm(T.forgetConfirm)) return;
+
+            GM_listValues().forEach((key) => GM_deleteValue(key));
+            document.getElementById('tg-api-banner')?.remove();
+            closeDialog();
+            alert(T.forgotten);
+        };
+
+        showDialog(T.checkupTitle,
+            h('ul', { class: 'tg-checkup' },
+                apiLine,
+                h('li', {}, T.checkupPhrase(Boolean(store.get('secretPhrase', ''))), ' ',
+                    h('button', { class: 'tg-btn tg-btn-small', type: 'button', text: T.menuPhrase, onclick: setSecretPhrase })),
+                h('li', {}, T.checkupBots(store.get('verifiedBots', []).length), ' ',
+                    h('button', { class: 'tg-btn tg-btn-small', type: 'button', text: T.menuBots, onclick: showVerifiedBots })),
+                h('li', {}, T.checkupData(data), ' ',
+                    h('button', { class: 'tg-btn tg-btn-small', type: 'button', text: T.checkupForget, onclick: forget }))
+            ),
+            h('p', {},
+                h('a', { href: `${REPO_URL}/security/policy`, target: '_blank', rel: 'noopener noreferrer', text: T.checkupSecurity }),
+                ' · ',
+                h('a', { href: `${REPO_URL}/releases/latest`, target: '_blank', rel: 'noopener noreferrer', text: T.menuUpdates })
+            )
+        );
+    }
+
+    function registerMenu(signedIn) {
+        if (typeof GM_registerMenuCommand !== 'function') return;
+
+        if (signedIn) GM_registerMenuCommand(T.menuCheckup, showCheckup);
+        GM_registerMenuCommand(T.menuPhrase, setSecretPhrase);
+        GM_registerMenuCommand(T.menuBots, showVerifiedBots);
+        GM_registerMenuCommand(T.menuUpdates, () => openTab(`${REPO_URL}/releases/latest`));
+    }
+
     // ----- styles -----
 
     function injectStyles() {
         GM_addStyle(`
-            #tg-api-banner { position: sticky; top: 0; z-index: 99999; display: flex; flex-wrap: wrap; gap: 10px;
-                align-items: center; padding: 12px 16px; background: #b3261e; color: #fff;
+            #tg-api-banner, #tg-report-guide { position: sticky; top: 0; z-index: 99999; display: flex; flex-wrap: wrap;
+                gap: 10px; align-items: center; padding: 12px 16px; background: #b3261e; color: #fff;
                 font: 600 14px/1.4 "Motiva Sans", Arial, sans-serif; box-shadow: 0 2px 8px rgba(0,0,0,.5); }
             #tg-api-banner.tg-unverified { background: #7a5c00; }
-            #tg-api-banner span { flex: 1 1 400px; }
+            #tg-report-guide { background: #1a4f7a; }
+            #tg-api-banner .tg-banner-text, #tg-report-guide .tg-banner-text { flex: 1 1 400px; }
+            .tg-phrase { margin-left: 6px; padding: 0 6px; border-radius: 3px; background: #2a475e; color: #fff;
+                font-weight: 600; }
+            .tg-btn-small { padding: 2px 8px; font-size: 12px; }
+            .tg-report { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin-top: 6px; }
+            .tg-report-hint { color: #8f98a0; font-size: 12px; }
+            .tg-confirm { margin-top: 4px; color: #c6d4df; font-style: italic; }
+            #tg-login-banner { position: relative; z-index: 99999; padding: 12px 16px; color: #fff;
+                font: 14px/1.5 "Motiva Sans", Arial, sans-serif; border-bottom: 4px solid #5c9e31; background: #1e3a14; }
+            #tg-login-banner.tg-warning { border-bottom-color: #e0a800; background: #4a3c00; }
+            #tg-login-banner.tg-danger { border-bottom-color: #e53935; background: #6b1414; }
+            #tg-login-banner .tg-login-host { font-size: 18px; font-weight: 600; margin: 4px 0; }
+            #tg-login-banner .tg-login-tip { color: #d0d8e0; font-size: 12px; margin-top: 4px; }
+            #tg-dialog { position: fixed; inset: 0; z-index: 100000; display: flex; align-items: center;
+                justify-content: center; background: rgba(0,0,0,.6); }
+            .tg-dialog-box { width: min(560px, calc(100vw - 32px)); max-height: 80vh; overflow: auto; padding: 16px;
+                border-radius: 4px; background: #1b2838; color: #c6d4df; font: 13px/1.5 "Motiva Sans", Arial, sans-serif;
+                box-shadow: 0 8px 24px rgba(0,0,0,.6); }
+            .tg-dialog-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 10px; }
+            .tg-textarea { width: 100%; box-sizing: border-box; background: #0e1720; color: #fff;
+                border: 1px solid #3a5268; }
+            .tg-bot-list, .tg-checkup { padding-left: 18px; }
+            .tg-dialog-box a { color: #66c0f4; }
             .tg-btn { padding: 6px 12px; border: 1px solid rgba(255,255,255,.7); border-radius: 3px;
                 background: transparent; color: #fff !important; font: inherit; cursor: pointer;
                 text-decoration: none !important; }
@@ -1874,17 +2526,28 @@ function runUserscript() {
     // ----- startup -----
 
     async function main() {
-        const selfId = Page.selfSteamId(pageScriptsText());
-        if (!selfId) return; // logged out
-
-        accountScope = selfId;
-
         const path = location.pathname;
         const page = Page.route(path, location.search);
+        const selfId = Page.selfSteamId(pageScriptsText());
+
+        accountScope = selfId;
+        registerMenu(Boolean(selfId));
+
+        // the sign-in page matters most while signed out, so it's handled before the sign-in check
+        if (page.kind === 'login') {
+            injectStyles();
+            guardLogin(page);
+            return;
+        }
+
+        if (!selfId) return; // logged out
+
         const onTradePage = /\/tradeoffers?(\/|$)/.test(path);
 
         injectStyles();
         showApiBanner(store.get('apikey', null));
+
+        if (location.hash === '#tradeguard-report') showReportGuide();
 
         checkApiKey(onTradePage || path.startsWith('/dev/apikey'))
             .then((status) => showApiBanner(status, true))
