@@ -42,13 +42,13 @@ A userscript that protects Steam traders from the scams that empty the most TF2 
 - **What the community wrote:** reads the partner's profile comments. Warnings from several different people ("scammer", "stole", "impostor", "-rep") raise the alert; praise like "+rep, not a scammer" doesn't count. A new account with its comments hidden gets a yellow note.
 - **Verified bots:** paste the SteamIDs from a trading site's official bot list (menu → *Verified bots*). From then on, any other account using one of those names is flagged red, even on first contact. Lists can be exported and imported as JSON.
 - **Before you confirm:** the trade window reminds you what the Steam app or email confirmation must show: the partner's name and account age.
-- **Report a scammer:** red panels get *Copy report*, *Steam* and *backpack.tf* buttons. Each copies a ready-to-paste report (scammer, who they copied, what was detected) and opens the place to send it. On Steam, the profile shows how to reach *Report Player → Attempted Trade Scam*. Trade Guard never submits anything itself.
+- **Report a scammer:** red panels get *Copy report*, *Steam* and *backpack.tf* buttons. Each copies a ready-to-paste report (scammer, who they copied, what was detected), written in the third person so it never says who your friends are, and opens the place to send it. On Steam, the profile shows how to reach *Report Player → Attempted Trade Scam*; that guide only appears for the button you just clicked, never from a link someone sends you. Trade Guard never submits anything itself.
 
 **Signing in through Steam** (`steamcommunity.com/openid/...`)
-- Shows which site you're signing in to. Known trading sites get a green bar, unknown sites a yellow one, and lookalike domains or a sign-in that sends you back to a different site a red one. It works before you sign in, on the password form itself.
+- Shows which site you're signing in to. Known trading sites get a green bar, unknown sites a yellow one, and lookalike domains, a sign-in that sends you back to a different site, or a request Steam could read two ways a red one. It works before you sign in, on the password form itself.
 
 **Your secret phrase** (menu → *Set secret phrase*)
-- Shown on every Trade Guard panel, banner and sign-in bar. A fake panel written into an offer message, or a fake "Steam login" window drawn inside a phishing site, can't show it: if the phrase is missing, it isn't Trade Guard.
+- Shown on every Trade Guard panel, banner and sign-in bar. A fake panel written into an offer message, or a fake "Steam login" window drawn inside a phishing site, can't show it: if the phrase is missing, it isn't Trade Guard. Keep it out of screenshots you share.
 
 **Security checkup** (menu → *Security checkup*)
 - Your API key status (with *Check now*), your secret phrase, your verified bots, what Trade Guard has stored, and a *Forget everything* button.
@@ -60,7 +60,7 @@ A userscript that protects Steam traders from the scams that empty the most TF2 
 
 - **Only talks to `steamcommunity.com`.** It makes no request to any other domain, has no `@connect` entries and doesn't use `GM_xmlhttpRequest`.
 - Doesn't read cookies or your session ID, and never sends, accepts or modifies trade offers. It only adds warning panels.
-- Everything it remembers (friends, past trade partners, cached profiles, your verified bots and secret phrase) stays in Tampermonkey's local storage. Data about your account is kept per Steam account, so alts on the same browser never mix. Of a partner's comments, only the scam warnings are kept. *Forget everything* in the security checkup deletes it all.
+- Everything it remembers (friends, past trade partners, cached profiles, your verified bots and secret phrase) stays in Tampermonkey's local storage. Data about your account is kept per Steam account, so alts on the same browser never mix. Of a partner's comments, only the scam warnings are kept. *Forget everything* in the security checkup deletes it all, except when each friend was first seen, so a reset can't make a recently added friend look long-standing.
 - Its permissions, and what for: storage (`GM_getValue`, `GM_setValue`, `GM_listValues`, `GM_deleteValue`), styles (`GM_addStyle`), the Tampermonkey menu (`GM_registerMenuCommand`), and the clipboard (`GM_setClipboard`), which is only written when you click a report or export button.
 - Names from Steam are inserted as plain text, never as HTML.
 - **It fails loudly.** If a check can't run (Steam changed a page, a request failed, the friends list didn't load), you get a yellow warning instead of a green "No alerts".
@@ -84,7 +84,7 @@ The script declares `@downloadURL none`, so Tampermonkey never updates it on its
 - It warns you, it can't stop you. Always check the items and the partner in the Steam Guard mobile confirmation.
 - Impostor detection only knows your friends, the partners it has seen while installed and your verified bots. A first contact with an impostor of a bot that isn't on your verified list can't be detected by name (a trade hold or a new account may still give it away).
 - The trade-hold check needs your own side of the trade to have no hold; otherwise it stays quiet rather than guess.
-- Comment warnings are a hint, not a verdict: friends joke, and scammers delete comments. Several different people warning is what raises the alert.
+- Comment warnings are a hint, not a verdict: friends joke, and scammers delete comments. Several different people warning is what raises the alert, and on a long-standing friend or a verified bot it stays a warning.
 - Steam has no direct link to its report form, so the *Steam* report button opens the profile and explains the three clicks. backpack.tf reports go through its issue tracker.
 - Item checks need Steam to describe each item: in a new offer they read the partner's public inventory, so a private inventory (or Steam's rate limit) means a yellow "couldn't check every item" instead.
 - Phishing detection knows Steam and the main TF2 trading sites. A phishing site that imitates something else only gets the generic "unknown link" warning.
@@ -95,11 +95,12 @@ The script declares `@downloadURL none`, so Tampermonkey never updates it on its
 ## Development
 
 The userscript is a single file with no dependencies, so what you read here is exactly what you install.
-It has three parts: `Core` (pure detection logic), `Page` (reads Steam's markup) and the browser layer.
-The tests cover all three:
+It has four parts: `Core` (pure detection logic), `Page` (reads Steam's markup), `Strings` (every text
+the user reads) and the browser layer. The tests cover all four:
 
 - `tests/core.test.js`: the detection logic, with cases taken from real data.
 - `tests/page.test.js`: page parsing, on HTML fixtures shaped like Steam's pages.
+- `tests/strings.test.js`: every alert has its text, and reports leave the user's contacts out.
 - `tests/userscript.test.js`: the whole script running on a simulated Steam page.
 - `tests/source.test.js`, `tests/style.test.js`: no hidden characters, no HTML built from strings, one style.
 

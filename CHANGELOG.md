@@ -17,7 +17,8 @@ and versions follow [Semantic Versioning](https://semver.org/).
 - **Verified bots:** a list you build from trading sites' official bot pages (menu). Copies of those bots
   are flagged red even on first contact. Import and export as JSON.
 - **Sign-in guard** on Steam's "Sign in through Steam" pages: which site you're signing in to, and a red
-  bar for lookalike domains or a sign-in that returns to a different site. Works while signed out.
+  bar for lookalike domains, a sign-in that returns to a different site, or a request Steam could read
+  two ways (repeated or aliased parameters). Works while signed out.
 - **Secret phrase** (menu), shown on every panel, banner and sign-in bar, so fakes can't pass for them.
 - **Report buttons** on red panels: copy a ready-to-paste report and open Steam's report flow (with a
   guide on the profile) or backpack.tf's issue tracker.
@@ -27,12 +28,35 @@ and versions follow [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
-- Values stored as plain text (the new secret phrase) were read back as broken JSON and dropped.
+- A panel without alerts printed "null".
+- Comment warnings like "do not trade" or "he scams" went unnoticed.
 
 ### Changed
 
 - New permissions: `GM_registerMenuCommand` (menu), `GM_setClipboard` (only on a button click),
   `GM_listValues` and `GM_deleteValue` (*Forget everything*). Still no requests outside steamcommunity.com.
+- Each account the user knows is now one contact, whether it's a friend, a past partner, a verified bot or
+  all three, so it gets one consistent verdict.
+- Reports are written in the third person and never say who the user's friends are.
+- Several people calling a long-standing friend or a verified bot a scammer is a warning, not a red verdict.
+- *Forget everything* keeps when each friend was first seen, so a reset can't turn a recent friend into a
+  trusted one.
+- The browser layer is organized into named sections, and every text lives in one `Strings` table.
+
+### Security
+
+Found by an independent review of this release before it was published, and fixed in it:
+
+- The report guide could be shown, with the user's secret phrase, on any profile through a link. It now
+  appears only for the report button just clicked, using a one-time code.
+- A verified-bots entry turned off every other check for that account, so a planted ID could pass a copy
+  of a friend as safe. It now only skips comparisons with other verified bots, and warns when a listed bot
+  goes by another name.
+- A secret phrase starting with `[` or `{` was dropped on reload, making real panels look fake.
+- The trade-hold check could be fooled by a partner name containing Steam's variable name.
+- Pasting a single SteamID into the verified list added nothing, and numeric IDs in a JSON list were
+  rounded to a different account.
+- A partner's private inventory was requested again for every item added to an offer.
 
 ## [0.7.2] - 2026-10-29
 
